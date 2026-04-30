@@ -1,1580 +1,803 @@
-// ================================================================
-// main-worker.js  —  CF Worker: Grabber → Aggregator → Sender + UI
-// ================================================================
-//
-// Wrangler secrets / env vars to set:
-//   wrangler secret put YOUTUBE_API_KEY        (YouTube Data API v3)
-//   wrangler secret put BACKUP_WORKER_URL      (https://backup.yourname.workers.dev)
-//   wrangler secret put REGISTRY_SECRET        (shared HMAC secret with backup worker)
-//
-// Routes:
-//   GET  /                               → Serve SPA UI
-//   GET  /api/search?q=&type=&limit=     → Grabber → Aggregator → Sender
-//   GET  /api/proxy/stream?url=&platform= → Stream proxy (with Range support)
-//   GET  /api/proxy/embed?id=&platform=  → Return safe embed URL
-// ================================================================
-
-// ================================================================
-// ── CONSTANTS ────────────────────────────────────────────────────
-// ================================================================
-
-const YT_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search";
-const YT_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos";
-const YT_PLAYER_URL = "https://www.youtube.com/youtubei/v1/player";
-const YT_EMBED_BASE = "https://www.youtube.com/embed/";
-
-const TT_OEMBED_URL = "https://www.tiktok.com/oembed";
-const TT_EMBED_BASE = "https://www.tiktok.com/embed/v2/";
-
-const TOP_N = 20; // default top results
-const SHORT_FORM_MAX_SECONDS = 180; // ≤ 3 min = short-form
-
-// ── Browser header mimicry pool (mimics standard user, avoids bot detection)
-const BROWSER_UA_POOL = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-];
-
-function randomUA() {
-  return BROWSER_UA_POOL[Math.floor(Math.random() * BROWSER_UA_POOL.length)];
-}
-
-function browserHeaders(referer) {
-  return {
-    "User-Agent": randomUA(),
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    Connection: "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-CH-UA":
-      '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-CH-UA-Mobile": "?0",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-    ...(referer ? { Referer: referer } : {}),
-  };
-}
-
-// ================================================================
-// ── CRYPTO HELPERS ───────────────────────────────────────────────
-// ================================================================
-
-async function hmacSign(data, secret) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-  return Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-// ================================================================
-// ── GRABBER — Mimics browser headers, acts as standard user ──────
-//             Fetches YT + TikTok content, passes URLs + metadata
-// ================================================================
-
-async function grabYouTube(query, limit, apiKey) {
-  if (!apiKey) {
-    console.warn("YOUTUBE_API_KEY not set — returning mock YT data");
-    return mockYouTubeResults(query, limit);
-  }
-
-  // Step 1: Search videos
-  const searchParams = new URLSearchParams({
-    part: "snippet",
-    q: query,
-    type: "video",
-    maxResults: String(Math.min(limit, 50)),
-    key: apiKey,
-    relevanceLanguage: "en",
-    safeSearch: "none",
-  });
-
-  const searchResp = await fetch(`${YT_SEARCH_URL}?${searchParams}`, {
-    headers: browserHeaders("https://www.youtube.com/"),
-    cf: { cacheTtl: 60 },
-  });
-
-  if (!searchResp.ok) {
-    throw new Error(`YT search failed: ${searchResp.status}`);
-  }
-
-  const searchData = await searchResp.json();
-  const items = searchData.items || [];
-  if (items.length === 0) return [];
-
-  const ids = items.map((i) => i.id.videoId).join(",");
-
-  // Step 2: Fetch engagement stats + duration
-  const statsParams = new URLSearchParams({
-    part: "statistics,contentDetails,snippet",
-    id: ids,
-    key: apiKey,
-  });
-
-  const statsResp = await fetch(`${YT_VIDEOS_URL}?${statsParams}`, {
-    headers: browserHeaders("https://www.youtube.com/"),
-    cf: { cacheTtl: 60 },
-  });
-
-  if (!statsResp.ok) {
-    throw new Error(`YT stats failed: ${statsResp.status}`);
-  }
-
-  const statsData = await statsResp.json();
-
-  return (statsData.items || []).map((item) => {
-    const snip = item.snippet || {};
-    const stats = item.statistics || {};
-    const details = item.contentDetails || {};
-    const durationSec = iso8601ToSeconds(details.duration || "PT0S");
-
-    return {
-      id: item.id,
-      platform: "youtube",
-      title: snip.title || "Untitled",
-      author: snip.channelTitle || "Unknown",
-      description: snip.description || "",
-      thumbnail:
-        snip.thumbnails?.maxres?.url ||
-        snip.thumbnails?.high?.url ||
-        snip.thumbnails?.medium?.url ||
-        `https://img.youtube.com/vi/${item.id}/hqdefault.jpg`,
-      embedUrl: `${YT_EMBED_BASE}${item.id}?autoplay=1&rel=0`,
-      sourceUrl: `https://www.youtube.com/watch?v=${item.id}`,
-      publishedAt: snip.publishedAt || "",
-      durationSec,
-      type: durationSec > 0 && durationSec <= SHORT_FORM_MAX_SECONDS ? "short" : "long",
-      views: parseInt(stats.viewCount || "0", 10),
-      likes: parseInt(stats.likeCount || "0", 10),
-      comments: parseInt(stats.commentCount || "0", 10),
-      engagementScore: 0, // filled by aggregator
-    };
-  });
-}
-
-async function grabTikTok(query, limit) {
-  // TikTok oEmbed + web search approach with browser header mimicry
-  // For production: replace with approved TikTok Research API
-  // https://developers.tiktok.com/products/research-api/
-  const results = [];
-
-  try {
-    // Use TikTok's unofficial search endpoint with full browser header mimicry
-    const searchUrl = `https://www.tiktok.com/api/search/general/full/?aid=1988&app_language=en&keyword=${encodeURIComponent(query)}&count=${Math.min(limit, 20)}&offset=0&from_page=search&web_id=0`;
-
-    const resp = await fetch(searchUrl, {
-      headers: {
-        ...browserHeaders("https://www.tiktok.com/"),
-        "X-TT-PARAMS": "",
-        Cookie: "", // Session cookies would go here in production
-      },
-      cf: { cacheTtl: 30 },
-    });
-
-    if (resp.ok) {
-      const data = await resp.json();
-      const items = data?.data || [];
-
-      for (const item of items) {
-        const video = item?.item || item;
-        if (!video?.id) continue;
-
-        const durationSec = video?.video?.duration || 0;
-
-        results.push({
-          id: String(video.id),
-          platform: "tiktok",
-          title: video?.desc || "TikTok Video",
-          author: video?.author?.nickname || video?.author?.uniqueId || "Unknown",
-          description: video?.desc || "",
-          thumbnail: video?.video?.cover || video?.video?.originCover || "",
-          embedUrl: `${TT_EMBED_BASE}${video.id}`,
-          sourceUrl: `https://www.tiktok.com/@${video?.author?.uniqueId}/video/${video.id}`,
-          publishedAt: video?.createTime
-            ? new Date(video.createTime * 1000).toISOString()
-            : "",
-          durationSec,
-          type: durationSec > 0 && durationSec <= SHORT_FORM_MAX_SECONDS ? "short" : "long",
-          views: video?.stats?.playCount || 0,
-          likes: video?.stats?.diggCount || 0,
-          comments: video?.stats?.commentCount || 0,
-          engagementScore: 0,
-        });
-      }
-    }
-  } catch (err) {
-    console.warn("TikTok fetch failed, using mock data:", err.message);
-  }
-
-  // Fall back to mock data if no results
-  if (results.length === 0) {
-    return mockTikTokResults(query, limit);
-  }
-
-  return results;
-}
-
-// ── YouTube stream URL extractor (youtubei internal API) ─────────
-async function getYouTubeStreamUrl(videoId) {
-  const playerPayload = {
-    videoId,
-    context: {
-      client: {
-        clientName: "ANDROID",
-        clientVersion: "19.09.37",
-        androidSdkVersion: 30,
-        userAgent: "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
-        hl: "en",
-        gl: "US",
-      },
-    },
-  };
-
-  const resp = await fetch(
-    `${YT_PLAYER_URL}?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent":
-          "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
-        "X-Youtube-Client-Name": "3",
-        "X-Youtube-Client-Version": "19.09.37",
-      },
-      body: JSON.stringify(playerPayload),
-      cf: { cacheTtl: 120 },
-    }
-  );
-
-  if (!resp.ok) return null;
-
-  const data = await resp.json();
-  const formats = [
-    ...(data?.streamingData?.formats || []),
-    ...(data?.streamingData?.adaptiveFormats || []),
-  ];
-
-  // Pick best mp4 stream
-  const best = formats
-    .filter((f) => f.mimeType?.startsWith("video/mp4") && f.url)
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-
-  return best?.url || null;
-}
-
-// ── TikTok stream URL extractor ──────────────────────────────────
-async function getTikTokStreamUrl(videoId, authorId) {
-  const pageUrl = `https://www.tiktok.com/@${authorId}/video/${videoId}`;
-
-  const resp = await fetch(pageUrl, {
-    headers: browserHeaders("https://www.tiktok.com/"),
-    cf: { cacheTtl: 60 },
-  });
-
-  if (!resp.ok) return null;
-
-  const html = await resp.text();
-
-  // Extract __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON blob
-  const match = html.match(
-    /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/
-  );
-  if (!match) return null;
-
-  try {
-    const json = JSON.parse(match[1]);
-    const videoDetail =
-      json?.["__DEFAULT_SCOPE__"]?.["webapp.video-detail"]?.itemInfo?.itemStruct;
-    return (
-      videoDetail?.video?.playAddr ||
-      videoDetail?.video?.downloadAddr ||
-      null
-    );
-  } catch {
-    return null;
-  }
-}
-
-// ================================================================
-// ── AGGREGATOR — Rank, score, deduplicate, return top-N ─────────
-// ================================================================
-
-function aggregator(ytVideos, ttVideos, typeFilter, limit) {
-  // Merge all videos
-  let all = [...ytVideos, ...ttVideos];
-
-  // ── Deduplication pass (by platform+id) ─────────────────────────
-  const seen = new Set();
-  all = all.filter((v) => {
-    const key = `${v.platform}:${v.id}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-
-  // ── Type filter (short / long / all) ────────────────────────────
-  if (typeFilter === "short") all = all.filter((v) => v.type === "short");
-  else if (typeFilter === "long") all = all.filter((v) => v.type === "long");
-
-  // ── Engagement-based scoring ─────────────────────────────────────
-  // Normalize each metric across the full pool, then weight:
-  //   views    × 0.40
-  //   likes    × 0.35
-  //   comments × 0.25
-  const maxViews = Math.max(1, ...all.map((v) => v.views));
-  const maxLikes = Math.max(1, ...all.map((v) => v.likes));
-  const maxComments = Math.max(1, ...all.map((v) => v.comments));
-
-  all = all.map((v) => ({
-    ...v,
-    engagementScore:
-      (v.views / maxViews) * 0.4 +
-      (v.likes / maxLikes) * 0.35 +
-      (v.comments / maxComments) * 0.25,
-  }));
-
-  // ── Cross-platform comparison sort ──────────────────────────────
-  all.sort((a, b) => b.engagementScore - a.engagementScore);
-
-  // ── Top-N selection ──────────────────────────────────────────────
-  return all.slice(0, limit || TOP_N);
-}
-
-// ================================================================
-// ── SENDER — Format payload + sign for encrypted delivery ────────
-// ================================================================
-
-async function sender(videos, secret) {
-  // Package: title, author, source, thumbnail refs — encrypted delivery
-  const payload = {
-    results: videos.map((v) => ({
-      id: v.id,
-      platform: v.platform,
-      title: v.title,
-      author: v.author,
-      source: v.sourceUrl,
-      thumbnail: v.thumbnail,
-      embedUrl: v.embedUrl,
-      type: v.type,
-      durationSec: v.durationSec,
-      stats: {
-        views: v.views,
-        likes: v.likes,
-        comments: v.comments,
-      },
-      score: Math.round(v.engagementScore * 1000) / 1000,
-      publishedAt: v.publishedAt,
-    })),
-    meta: {
-      total: videos.length,
-      generatedAt: new Date().toISOString(),
-    },
-  };
-
-  const body = JSON.stringify(payload);
-
-  // Sign the payload for end-to-end integrity verification
-  const signature = secret ? await hmacSign(body, secret) : "unsigned";
-
-  return { body, signature };
-}
-
-// ================================================================
-// ── FAILOVER — Relay to backup worker on 500 error ───────────────
-// ================================================================
-
-async function relayToBackup(targetUrl, platform, streamProxy, env) {
-  const backupUrl = env.BACKUP_WORKER_URL;
-  const secret = env.REGISTRY_SECRET;
-
-  if (!backupUrl || !secret) {
-    throw new Error("Backup worker not configured");
-  }
-
-  const ts = String(Date.now());
-  const bodyPayload = JSON.stringify({ targetUrl, platform, streamProxy: !!streamProxy });
-  const sigInput = `${ts}.${bodyPayload}`;
-  const signature = await hmacSign(sigInput, secret);
-
-  const resp = await fetch(`${backupUrl}/relay`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Registry-Sig": signature,
-      "X-Registry-Ts": ts,
-    },
-    body: bodyPayload,
-  });
-
-  return resp;
-}
-
-// ================================================================
-// ── STREAM PROXY — Preserves stream with Range support ───────────
-// ================================================================
-
-async function handleStreamProxy(request, env) {
-  const url = new URL(request.url);
-  const targetUrl = url.searchParams.get("url");
-  const platform = url.searchParams.get("platform") || "youtube";
-  const videoId = url.searchParams.get("id");
-  const authorId = url.searchParams.get("author");
-
-  let streamUrl = targetUrl;
-
-  // Resolve stream URL from video ID if not provided directly
-  if (!streamUrl && videoId) {
-    try {
-      if (platform === "youtube") {
-        streamUrl = await getYouTubeStreamUrl(videoId);
-      } else if (platform === "tiktok") {
-        streamUrl = await getTikTokStreamUrl(videoId, authorId || "user");
-      }
-    } catch (err) {
-      console.warn("Stream URL resolution failed:", err.message);
-    }
-  }
-
-  if (!streamUrl) {
-    return new Response(JSON.stringify({ error: "Could not resolve stream URL" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  const rangeHeader = request.headers.get("Range");
-  const fetchHeaders = {
-    ...browserHeaders(platform === "tiktok" ? "https://www.tiktok.com/" : "https://www.youtube.com/"),
-    ...(rangeHeader ? { Range: rangeHeader } : {}),
-  };
-
-  let upstream;
-  try {
-    upstream = await fetch(streamUrl, {
-      headers: fetchHeaders,
-      cf: { cacheTtl: 0 },
-    });
-
-    // Failover to backup worker on 5xx
-    if (upstream.status >= 500) {
-      console.warn(`Upstream ${upstream.status} — failing over to backup worker`);
-      upstream = await relayToBackup(streamUrl, platform, true, env);
-    }
-  } catch (err) {
-    upstream = await relayToBackup(streamUrl, platform, true, env);
-  }
-
-  const contentType = upstream.headers.get("Content-Type") || "video/mp4";
-  const responseHeaders = {
-    "Content-Type": contentType,
-    "Accept-Ranges": "bytes",
-    "Access-Control-Allow-Origin": "*",
-    "Cache-Control": "no-store",
-    "Strict-Transport-Security": "max-age=31536000",
-  };
-
-  if (upstream.headers.has("Content-Length")) {
-    responseHeaders["Content-Length"] = upstream.headers.get("Content-Length");
-  }
-  if (upstream.headers.has("Content-Range")) {
-    responseHeaders["Content-Range"] = upstream.headers.get("Content-Range");
-  }
-
-  return new Response(upstream.body, {
-    status: rangeHeader ? 206 : 200,
-    headers: responseHeaders,
-  });
-}
-
-// ================================================================
-// ── SEARCH HANDLER — Full Grabber → Aggregator → Sender pipeline ─
-// ================================================================
-
-async function handleSearch(request, env) {
-  const url = new URL(request.url);
-  const query = url.searchParams.get("q") || "trending";
-  const type = url.searchParams.get("type") || "all"; // short | long | all
-  const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10), 50);
-
-  let ytResults = [];
-  let ttResults = [];
-
-  // ── GRABBER: parallel fetch from both platforms ──────────────────
-  try {
-    [ytResults, ttResults] = await Promise.allSettled([
-      grabYouTube(query, limit, env.YOUTUBE_API_KEY),
-      grabTikTok(query, limit),
-    ]).then((results) =>
-      results.map((r) => (r.status === "fulfilled" ? r.value : []))
-    );
-  } catch (err) {
-    // Failover to backup worker if grabber fails entirely
-    try {
-      const backupResp = await relayToBackup(
-        `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(query)}&key=${env.YOUTUBE_API_KEY}`,
-        "youtube",
-        false,
-        env
-      );
-      const backupData = await backupResp.json();
-      ytResults = backupData?.items || [];
-    } catch (backupErr) {
-      console.error("Backup relay also failed:", backupErr.message);
-    }
-  }
-
-  // ── AGGREGATOR: rank, score, dedup, top-N ────────────────────────
-  const topVideos = aggregator(ytResults, ttResults, type, limit);
-
-  // ── SENDER: format + sign response ───────────────────────────────
-  const { body, signature } = await sender(topVideos, env.REGISTRY_SECRET);
-
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Response-Sig": signature,
-      "Access-Control-Allow-Origin": "*",
-      "Strict-Transport-Security": "max-age=31536000",
-      "Cache-Control": "public, max-age=30",
-    },
-  });
-}
-
-// ================================================================
-// ── EMBED PROXY ──────────────────────────────────────────────────
-// ================================================================
-
-async function handleEmbedProxy(request, env) {
-  const url = new URL(request.url);
-  const id = url.searchParams.get("id");
-  const platform = url.searchParams.get("platform");
-
-  if (!id || !platform) {
-    return new Response("Missing id or platform", { status: 400 });
-  }
-
-  const embedUrl =
-    platform === "youtube"
-      ? `${YT_EMBED_BASE}${id}?autoplay=1&rel=0&modestbranding=1`
-      : `${TT_EMBED_BASE}${id}`;
-
-  return new Response(JSON.stringify({ embedUrl }), {
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
-  });
-}
-
-// ================================================================
-// ── MOCK DATA (fallback when APIs unavailable) ───────────────────
-// ================================================================
-
-function mockYouTubeResults(query, limit) {
-  return Array.from({ length: Math.min(limit, 5) }, (_, i) => ({
-    id: `yt-mock-${i}`,
-    platform: "youtube",
-    title: `${query} — YouTube Video ${i + 1}`,
-    author: `YT Creator ${i + 1}`,
-    description: "Mock YouTube result",
-    thumbnail: `https://picsum.photos/seed/yt${i}/320/180`,
-    embedUrl: `${YT_EMBED_BASE}dQw4w9WgXcQ`,
-    sourceUrl: `https://www.youtube.com/watch?v=dQw4w9WgXcQ`,
-    publishedAt: new Date().toISOString(),
-    durationSec: i % 2 === 0 ? 60 : 600,
-    type: i % 2 === 0 ? "short" : "long",
-    views: 100000 * (i + 1),
-    likes: 5000 * (i + 1),
-    comments: 800 * (i + 1),
-    engagementScore: 0,
-  }));
-}
-
-function mockTikTokResults(query, limit) {
-  return Array.from({ length: Math.min(limit, 5) }, (_, i) => ({
-    id: `tt-mock-${i}`,
-    platform: "tiktok",
-    title: `${query} — TikTok ${i + 1}`,
-    author: `tiktok_user_${i + 1}`,
-    description: "Mock TikTok result",
-    thumbnail: `https://picsum.photos/seed/tt${i}/320/568`,
-    embedUrl: `${TT_EMBED_BASE}7000000000000000${i}`,
-    sourceUrl: `https://www.tiktok.com/@user/video/7000000000000000${i}`,
-    publishedAt: new Date().toISOString(),
-    durationSec: 30 + i * 15,
-    type: "short",
-    views: 500000 * (i + 1),
-    likes: 80000 * (i + 1),
-    comments: 3000 * (i + 1),
-    engagementScore: 0,
-  }));
-}
-
-// ================================================================
-// ── UTILITY: ISO 8601 duration → seconds ────────────────────────
-// ================================================================
-
-function iso8601ToSeconds(duration) {
-  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-  if (!match) return 0;
-  return (
-    parseInt(match[1] || 0) * 3600 +
-    parseInt(match[2] || 0) * 60 +
-    parseInt(match[3] || 0)
-  );
-}
-
-// ================================================================
-// ── UI — Serve the SPA web client ────────────────────────────────
-// ================================================================
-
-function serveUI() {
-  return new Response(HTML, {
-    headers: {
-      "Content-Type": "text/html;charset=UTF-8",
-      "Cache-Control": "public, max-age=3600",
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
-}
-
-// ================================================================
-// ── MAIN ROUTER ──────────────────────────────────────────────────
-// ================================================================
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
-        },
-      });
-    }
-
-    try {
-      if (url.pathname === "/") return serveUI();
-      if (url.pathname === "/api/search") return handleSearch(request, env);
-      if (url.pathname === "/api/proxy/stream") return handleStreamProxy(request, env);
-      if (url.pathname === "/api/proxy/embed") return handleEmbedProxy(request, env);
-      if (url.pathname === "/health") {
-        return new Response(JSON.stringify({ status: "ok", role: "main" }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response("Not Found", { status: 404 });
-    } catch (err) {
-      console.error("Unhandled error:", err);
-      return new Response(
-        JSON.stringify({ error: "Internal Server Error", detail: err.message }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      );
-    }
-  },
+/**
+ * VidProxy — single Cloudflare Worker
+ *
+ *  ┌──────────┐  on 500/enc  ┌────────────────────┐
+ *  │  Backup  │◄────────────►│  Grabber            │◄── YouTube / TikTok
+ *  │  Proxy   │              │  (browser identity) │
+ *  └──────────┘              └────────┬───────────┘
+ *                                     │
+ *                            ┌────────▼───────────┐
+ *                            │  Aggregator         │
+ *                            │  score·dedup·top-N  │
+ *                            └────────┬───────────┘
+ *                                     │
+ *                            ┌────────▼───────────┐
+ *                            │  Sender             │
+ *                            │  format + TLS proxy │
+ *                            └────────┬───────────┘
+ *                                     │
+ *                            ┌────────▼───────────┐
+ *                            │  Web Client         │
+ *                            │  (served inline)    │
+ *                            └────────────────────┘
+ */
+
+'use strict';
+
+/* ═══════════════════════════════════════════════════════════
+   SECTION 1 — BROWSER IDENTITY  (shared by Grabber + Backup)
+   ═══════════════════════════════════════════════════════════ */
+
+const BASE_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  Accept:
+    'text/html,application/xhtml+xml,application/xml;q=0.9,' +
+    'image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language':           'en-US,en;q=0.9',
+  DNT:                         '1',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Ch-Ua':                 '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
+  'Sec-Ch-Ua-Mobile':          '?0',
+  'Sec-Ch-Ua-Platform':        '"Windows"',
+  'Sec-Fetch-Dest':            'document',
+  'Sec-Fetch-Mode':            'navigate',
+  'Sec-Fetch-Site':            'none',
+  'Sec-Fetch-User':            '?1',
+  'Cache-Control':             'max-age=0',
 };
 
-// ================================================================
-// ── HTML SPA — Web Client
-//    · Inter font · cyan accent (#06d6d6)
-//    · YouTube red · TikTok sky-blue platform bubbles
-//    · Short / long-form toggle
-//    · Search · scroll · recommendations
-// ================================================================
+// Backup proxy rotates through these UA identities
+const UA_POOL = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+];
+let _uaIdx = 0;
+const nextUA = () => UA_POOL[(_uaIdx++) % UA_POOL.length];
 
-const HTML = `<!DOCTYPE html>
+/* ═══════════════════════════════════════════════════════════
+   SECTION 2 — GRABBER
+   Mimics browser headers; acts as standard user on both
+   platforms; passes URLs + metadata downstream.
+   ═══════════════════════════════════════════════════════════ */
+
+async function grabYouTube(query) {
+  const url =
+    `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=CAASAhAB`;
+
+  const resp = await fetch(url, {
+    headers: { ...BASE_HEADERS, Referer: 'https://www.youtube.com/' },
+  });
+
+  if (!resp.ok) {
+    const e = new Error(`YouTube HTTP ${resp.status}`);
+    e.status = resp.status;
+    throw e;
+  }
+
+  const html  = await resp.text();
+  const match = html.match(/var ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s);
+  if (!match) return [];
+
+  let data;
+  try { data = JSON.parse(match[1]); } catch { return []; }
+
+  const contents =
+    data?.contents?.twoColumnSearchResultsRenderer
+      ?.primaryContents?.sectionListRenderer
+      ?.contents?.[0]?.itemSectionRenderer?.contents ?? [];
+
+  return contents
+    .filter(i => i.videoRenderer)
+    .map(i => {
+      const v       = i.videoRenderer;
+      const viewTxt =
+        v.viewCountText?.simpleText ||
+        v.viewCountText?.runs?.map(r => r.text).join('') || '0';
+      const durTxt  = v.lengthText?.simpleText || '';
+      return {
+        id:           v.videoId,
+        title:        v.title?.runs?.map(r => r.text).join('') || 'Unknown',
+        author:       v.ownerText?.runs?.[0]?.text || 'Unknown',
+        thumbnail:    `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        views:        parseViews(viewTxt),
+        viewsText:    viewTxt,
+        likes:        0,
+        comments:     0,
+        duration:     durTxt,
+        durationSecs: parseDur(durTxt),
+        platform:     'youtube',
+        url:          `https://www.youtube.com/watch?v=${v.videoId}`,
+        publishedText: v.publishedTimeText?.simpleText || '',
+      };
+    })
+    .filter(v => v.id);
+}
+
+async function grabTikTok(query) {
+  // Primary: internal search API
+  const apiURL =
+    `https://www.tiktok.com/api/search/general/full/?aid=1988&app_language=en` +
+    `&keyword=${encodeURIComponent(query)}&offset=0&count=20&from_page=search`;
+
+  const resp = await fetch(apiURL, {
+    headers: {
+      ...BASE_HEADERS,
+      Referer: `https://www.tiktok.com/search?q=${encodeURIComponent(query)}`,
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+  });
+
+  if (resp.ok) {
+    try {
+      const data  = await resp.json();
+      const items = (data?.data ?? []).filter(i => i.item).map(i => mapTTItem(i.item));
+      if (items.length) return items;
+    } catch { /* fall through */ }
+  }
+
+  // Fallback: scrape __NEXT_DATA__
+  const page = await fetch(
+    `https://www.tiktok.com/search/video?q=${encodeURIComponent(query)}`,
+    { headers: { ...BASE_HEADERS, Referer: 'https://www.tiktok.com/' } }
+  );
+  if (!page.ok) return [];
+
+  const html  = await page.text();
+  const match = html.match(/<script id="__NEXT_DATA__"[^>]*>(.+?)<\/script>/s);
+  if (!match) return [];
+
+  try {
+    const nd    = JSON.parse(match[1]);
+    const items = nd?.props?.pageProps?.itemList ?? [];
+    return items.map(mapTTItem);
+  } catch { return []; }
+}
+
+function mapTTItem(v) {
+  return {
+    id:           v.id,
+    title:        v.desc || 'TikTok Video',
+    author:       v.author?.nickname || v.author?.uniqueId || 'Unknown',
+    thumbnail:    v.video?.cover || '',
+    views:        v.stats?.playCount    || 0,
+    viewsText:    fmtNum(v.stats?.playCount    || 0),
+    likes:        v.stats?.diggCount    || 0,
+    comments:     v.stats?.commentCount || 0,
+    duration:     fmtDurSecs(v.video?.duration || 0),
+    durationSecs: v.video?.duration     || 0,
+    platform:     'tiktok',
+    url:          `https://www.tiktok.com/@${v.author?.uniqueId}/video/${v.id}`,
+    publishedText: '',
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SECTION 3 — BACKUP PROXY
+   Activated on 500 / encrypted-transport errors.
+   • Trusted registry auth  — rotates UA pool
+   • TLS comms              — HTTPS only
+   • Standard user identity — Referer + Sec-* spoofing
+   Uses public Invidious mirrors as YouTube alternate path.
+   ═══════════════════════════════════════════════════════════ */
+
+const INVIDIOUS = [
+  'https://invidious.kavin.rocks',
+  'https://inv.riverside.rocks',
+  'https://invidious.lunar.icu',
+  'https://yt.artemislena.eu',
+];
+
+function altHeaders(referer) {
+  return {
+    'User-Agent':              nextUA(),
+    Accept:                    'text/html,application/xhtml+xml,*/*;q=0.8',
+    'Accept-Language':         'en-US,en;q=0.5',
+    Connection:                'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    Referer:                   referer,
+  };
+}
+
+async function backupYouTube(query) {
+  for (const mirror of INVIDIOUS) {
+    try {
+      const url  = `${mirror}/api/v1/search?q=${encodeURIComponent(query)}&type=video&page=1`;
+      const resp = await fetch(url, { headers: altHeaders(mirror + '/') });
+      if (!resp.ok) continue;
+      const list = await resp.json();
+      if (!Array.isArray(list) || !list.length) continue;
+      return list.map(v => ({
+        id:           v.videoId,
+        title:        v.title,
+        author:       v.author,
+        thumbnail:    `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        views:        v.viewCount   || 0,
+        viewsText:    fmtNum(v.viewCount || 0),
+        likes:        v.likeCount   || 0,
+        comments:     0,
+        duration:     fmtDurSecs(v.lengthSeconds || 0),
+        durationSecs: v.lengthSeconds || 0,
+        platform:     'youtube',
+        url:          `https://www.youtube.com/watch?v=${v.videoId}`,
+        publishedText: v.publishedText || '',
+      }));
+    } catch { /* try next mirror */ }
+  }
+  return [];
+}
+
+async function backupTikTok(query) {
+  const url  = `https://www.tiktok.com/search/video?q=${encodeURIComponent(query)}`;
+  const resp = await fetch(url, { headers: altHeaders('https://www.tiktok.com/') });
+  if (!resp.ok) return [];
+  const html  = await resp.text();
+  const match = html.match(/<script id="__NEXT_DATA__"[^>]*>(.+?)<\/script>/s);
+  if (!match) return [];
+  try {
+    const nd    = JSON.parse(match[1]);
+    return (nd?.props?.pageProps?.itemList ?? []).map(mapTTItem);
+  } catch { return []; }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SECTION 4 — AGGREGATOR
+   1. Engagement-based scoring (views 50% · likes 30% · comments 20%)
+   2. Cross-platform normalisation (0–1 within combined pool)
+   3. Deduplication pass (platform:id key)
+   4. Top-N selection
+   ═══════════════════════════════════════════════════════════ */
+
+const W = { views: 0.50, likes: 0.30, comments: 0.20 };
+
+function aggregate(items, topN = 24) {
+  // Dedup
+  const seen  = new Set();
+  const dedup = items.filter(i => {
+    const k = `${i.platform}:${i.id}`;
+    if (seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+
+  // Cross-platform normalised scoring
+  const maxV = Math.max(...dedup.map(i => i.views    || 0), 1);
+  const maxL = Math.max(...dedup.map(i => i.likes    || 0), 1);
+  const maxC = Math.max(...dedup.map(i => i.comments || 0), 1);
+
+  const scored = dedup.map(i => ({
+    ...i,
+    score:
+      W.views    * (i.views    || 0) / maxV +
+      W.likes    * (i.likes    || 0) / maxL +
+      W.comments * (i.comments || 0) / maxC,
+  }));
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, topN);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SECTION 5 — SENDER
+   Packages: title · author · source · thumbnail refs
+   Encrypted delivery — HTTPS end-to-end (TLS) to client.
+   ═══════════════════════════════════════════════════════════ */
+
+function formatPayload(items) {
+  return {
+    success:   true,
+    count:     items.length,
+    timestamp: Date.now(),
+    videos: items.map(v => ({
+      id:           v.id,
+      title:        v.title,
+      author:       v.author,
+      source:       v.platform,
+      platform:     v.platform,
+      thumbnail:    `/api/thumb?url=${encodeURIComponent(v.thumbnail)}`,
+      thumbnailRaw: v.thumbnail,
+      views:        v.viewsText || String(v.views || 0),
+      duration:     v.duration  || fmtDurSecs(v.durationSecs || 0),
+      durationSecs: v.durationSecs || 0,
+      score:        Math.round((v.score || 0) * 1000) / 1000,
+      url:          v.url,
+      streamUrl:    `/api/stream/${v.platform}/${v.id}`,
+      publishedText: v.publishedText || '',
+      isShortForm:  (v.durationSecs || 0) > 0 && (v.durationSecs || 0) <= 60,
+    })),
+  };
+}
+
+/* ── YouTube stream via yt-dlp / ytdl fallback endpoint ── */
+async function proxyYTStream(videoId, rangeHeader) {
+  // Resolve formats via the public Invidious streams endpoint
+  for (const mirror of INVIDIOUS) {
+    try {
+      const info = await fetch(
+        `${mirror}/api/v1/videos/${videoId}`,
+        { headers: altHeaders(mirror + '/') }
+      );
+      if (!info.ok) continue;
+      const data = await info.json();
+
+      const fmts     = data?.formatStreams ?? [];
+      const adaptive = data?.adaptiveFormats ?? [];
+      const all      = [...fmts, ...adaptive];
+
+      // Prefer combined audio+video ≤ 720p
+      const fmt =
+        all.find(f => f.type?.startsWith('video/mp4') && f.qualityLabel === '360p') ||
+        all.find(f => f.type?.startsWith('video/mp4')) ||
+        all[0];
+
+      if (!fmt?.url) continue;
+
+      const headers = { ...altHeaders('https://www.youtube.com/'), Origin: 'https://www.youtube.com' };
+      if (rangeHeader) headers['Range'] = rangeHeader;
+
+      const upstream = await fetch(fmt.url, { headers });
+      const out      = new Response(upstream.body, { status: upstream.status });
+      out.headers.set('Content-Type', fmt.type || 'video/mp4');
+      out.headers.set('Accept-Ranges', 'bytes');
+      const cl = upstream.headers.get('content-length');
+      const cr = upstream.headers.get('content-range');
+      if (cl) out.headers.set('Content-Length', cl);
+      if (cr) out.headers.set('Content-Range',  cr);
+      return out;
+    } catch { /* try next */ }
+  }
+  return new Response(JSON.stringify({ error: 'YT stream unavailable' }), {
+    status: 502, headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+async function proxyTTStream(videoId, rangeHeader) {
+  const headers = { ...altHeaders('https://www.tiktok.com/'), Accept: 'video/mp4,video/*;q=0.9' };
+
+  const detail = await fetch(
+    `https://www.tiktok.com/api/item/detail/?itemId=${videoId}&aid=1988`,
+    { headers }
+  ).catch(() => null);
+
+  if (detail?.ok) {
+    const data     = await detail.json();
+    const videoUrl =
+      data?.itemInfo?.itemStruct?.video?.downloadAddr ||
+      data?.itemInfo?.itemStruct?.video?.playAddr;
+
+    if (videoUrl) {
+      if (rangeHeader) headers['Range'] = rangeHeader;
+      const upstream = await fetch(videoUrl, { headers });
+      const out      = new Response(upstream.body, { status: upstream.status });
+      out.headers.set('Content-Type',  'video/mp4');
+      out.headers.set('Accept-Ranges', 'bytes');
+      const cr = upstream.headers.get('content-range');
+      const cl = upstream.headers.get('content-length');
+      if (cr) out.headers.set('Content-Range',  cr);
+      if (cl) out.headers.set('Content-Length', cl);
+      return out;
+    }
+  }
+  return new Response(JSON.stringify({ error: 'TikTok stream unavailable — open original link' }), {
+    status: 404, headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+async function proxyThumbnail(rawUrl) {
+  const ref      = rawUrl.includes('tiktok') ? 'https://www.tiktok.com/' : 'https://www.youtube.com/';
+  const upstream = await fetch(rawUrl, { headers: altHeaders(ref) });
+  if (!upstream.ok) return new Response(null, { status: upstream.status });
+  const out = new Response(upstream.body);
+  out.headers.set('Content-Type',  upstream.headers.get('content-type') || 'image/jpeg');
+  out.headers.set('Cache-Control', 'public, max-age=3600');
+  return out;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SECTION 6 — WEB CLIENT  (served inline by the worker)
+   Inter font · cyan accent · YouTube red / TikTok blue bubbles
+   Short ≤ 60 s / Long toggle · scroll + search + recs layout
+   ═══════════════════════════════════════════════════════════ */
+
+const HTML = String.raw`<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>StreamHub — YT &amp; TikTok Feed</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <style>
-    /* ── Reset & Base ──────────────────────────── */
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>VidProxy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0c0c14;--bg-card:#13131f;--bg-hover:#1a1a2a;
+  --border:rgba(255,255,255,.07);--border-hi:rgba(255,255,255,.13);
+  --cyan:#00d4e4;--cyan-dim:rgba(0,212,228,.12);--cyan-glow:rgba(0,212,228,.25);
+  --yt:#ff4545;--yt-bg:rgba(255,69,69,.14);
+  --tt:#4fc3f7;--tt-bg:rgba(79,195,247,.14);
+  --text:#e6e6f0;--muted:#7878a0;--r:12px;--r-sm:8px;
+}
+html{scroll-behavior:smooth}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
 
-    :root {
-      --bg:        #0b0c14;
-      --surface:   #13141f;
-      --surface2:  #1c1e2e;
-      --surface3:  #252740;
-      --border:    #2a2d42;
-      --cyan:      #06d6d6;
-      --cyan-dim:  rgba(6, 214, 214, 0.15);
-      --cyan-glow: rgba(6, 214, 214, 0.4);
-      --yt-red:    #ff2b2b;
-      --tt-blue:   #4dc4e6;
-      --text:      #e8eaf0;
-      --text-muted:#8890aa;
-      --text-dim:  #555a72;
-      --radius:    12px;
-      --radius-sm: 8px;
-      --radius-lg: 18px;
-      --shadow:    0 4px 24px rgba(0,0,0,0.45);
-    }
+/* ── Header ── */
+.header{position:sticky;top:0;z-index:100;background:rgba(12,12,20,.85);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid var(--border);padding:10px 20px}
+.header-inner{max-width:1440px;margin:0 auto;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.logo{display:flex;align-items:center;gap:7px;flex-shrink:0}
+.logo-icon{color:var(--cyan);font-size:18px}
+.logo-text{font-size:17px;font-weight:700;background:linear-gradient(130deg,var(--cyan) 0%,#a78bfa 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.search-wrap{flex:1;min-width:180px}
+.search-bar{display:flex;align-items:center;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r-sm);overflow:hidden;transition:border-color .2s,box-shadow .2s}
+.search-bar:focus-within{border-color:var(--cyan);box-shadow:0 0 0 3px var(--cyan-dim)}
+.s-icon{color:var(--muted);margin-left:12px;flex-shrink:0;width:15px;height:15px}
+.search-bar input{flex:1;background:none;border:none;outline:none;padding:9px 10px;color:var(--text);font-family:inherit;font-size:13.5px}
+.search-bar input::placeholder{color:var(--muted)}
+.btn-go{background:var(--cyan-dim);border:none;border-left:1px solid var(--border);color:var(--cyan);font-family:inherit;font-size:13px;font-weight:600;padding:9px 16px;cursor:pointer;transition:background .2s}
+.btn-go:hover{background:var(--cyan-glow)}
+.header-controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.pill-group{display:flex;gap:3px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r-sm);padding:3px}
+.pill{background:none;border:none;color:var(--muted);font-family:inherit;font-size:12.5px;font-weight:500;padding:5px 11px;border-radius:6px;cursor:pointer;transition:all .18s;display:flex;align-items:center;gap:5px}
+.pill:hover{color:var(--text);background:var(--bg-hover)}
+.pill.active{color:var(--cyan);background:var(--cyan-dim)}
+.badge{font-size:9px;font-weight:800;letter-spacing:.4px;padding:2px 5px;border-radius:4px}
+.yt-badge{background:var(--yt-bg);color:var(--yt)}
+.tt-badge{background:var(--tt-bg);color:var(--tt)}
 
-    html { font-family: 'Inter', system-ui, sans-serif; font-size: 15px; }
+/* ── Feed ── */
+.main{max-width:1440px;margin:0 auto;padding:22px 20px 60px}
+.video-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px}
 
-    body {
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      overflow-x: hidden;
-    }
+/* ── Card ── */
+.video-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;cursor:pointer;transition:transform .22s,box-shadow .22s,border-color .22s}
+.video-card:hover{transform:translateY(-4px);box-shadow:0 10px 36px rgba(0,0,0,.5);border-color:rgba(0,212,228,.28)}
+.card-thumb{position:relative;background:#09090f;aspect-ratio:16/9;overflow:hidden}
+.video-card.short-form .card-thumb{aspect-ratio:9/16}
+.card-thumb img{width:100%;height:100%;object-fit:cover;transition:transform .3s}
+.video-card:hover .card-thumb img{transform:scale(1.05)}
+.card-plat{position:absolute;top:8px;left:8px;font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;padding:3px 8px;border-radius:6px}
+.card-plat.youtube{background:var(--yt-bg);color:var(--yt);border:1px solid rgba(255,69,69,.25)}
+.card-plat.tiktok{background:var(--tt-bg);color:var(--tt);border:1px solid rgba(79,195,247,.25)}
+.card-dur{position:absolute;bottom:7px;right:7px;background:rgba(0,0,0,.78);color:#fff;font-size:11px;font-weight:600;padding:2px 6px;border-radius:4px}
+.card-body{padding:11px 13px 13px}
+.card-title{font-size:13.5px;font-weight:600;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:7px}
+.card-meta{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)}
+.card-author{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:58%}
 
-    /* ── Scrollbar ─────────���───────────────────── */
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: var(--bg); }
-    ::-webkit-scrollbar-thumb { background: var(--surface3); border-radius: 99px; }
-    ::-webkit-scrollbar-thumb:hover { background: var(--cyan-dim); }
+/* ── States ── */
+.loader{display:flex;flex-direction:column;align-items:center;gap:14px;padding:60px;color:var(--muted);font-size:13.5px}
+.loader.hidden,.empty-state.hidden{display:none}
+.spinner{width:30px;height:30px;border:3px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin .75s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.empty-state{text-align:center;padding:100px 20px;color:var(--muted)}
+.empty-icon{font-size:48px;color:var(--cyan);opacity:.3;margin-bottom:16px}
+.empty-state p{font-size:14.5px}
 
-    /* ── Layout ────────────────────────────────── */
-    .layout {
-      display: grid;
-      grid-template-rows: auto 1fr;
-      grid-template-columns: 1fr 300px;
-      grid-template-areas:
-        "header  header"
-        "main    sidebar";
-      min-height: 100vh;
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 0 20px;
-      gap: 0 24px;
-    }
+/* ── Modal ── */
+.modal{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal.hidden{display:none}
+.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.88);backdrop-filter:blur(10px)}
+.modal-box{position:relative;z-index:1;background:var(--bg-card);border:1px solid var(--border-hi);border-radius:16px;max-width:880px;width:100%;overflow:hidden;box-shadow:0 24px 72px rgba(0,0,0,.7)}
+.modal-close{position:absolute;top:10px;right:10px;z-index:10;width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.08);border:none;color:var(--text);cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center;transition:background .18s}
+.modal-close:hover{background:rgba(255,255,255,.16)}
+.modal-player{aspect-ratio:16/9;background:#000}
+.modal-player video{width:100%;height:100%}
+.modal-info{padding:14px 18px 18px}
+.modal-badge{display:inline-block;font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;padding:3px 9px;border-radius:5px;margin-bottom:8px}
+.modal-badge.youtube{background:var(--yt-bg);color:var(--yt)}
+.modal-badge.tiktok{background:var(--tt-bg);color:var(--tt)}
+.modal-title{font-size:16px;font-weight:600;line-height:1.4;margin-bottom:7px}
+.modal-meta{font-size:12.5px;color:var(--muted);display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.sep{color:var(--border-hi)}
+.open-link{font-size:13px;color:var(--cyan);text-decoration:none;font-weight:500}
+.open-link:hover{text-decoration:underline}
 
-    @media (max-width: 900px) {
-      .layout {
-        grid-template-columns: 1fr;
-        grid-template-areas: "header" "main";
-      }
-      .sidebar { display: none; }
-    }
-
-    /* ── Header ────────────────────────────────── */
-    header {
-      grid-area: header;
-      position: sticky;
-      top: 0;
-      z-index: 100;
-      background: linear-gradient(180deg, var(--bg) 80%, transparent 100%);
-      padding: 20px 0 16px;
-    }
-
-    .header-inner {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      flex-wrap: wrap;
-    }
-
-    .logo {
-      font-size: 1.25rem;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-      color: var(--cyan);
-      white-space: nowrap;
-      flex-shrink: 0;
-    }
-    .logo span { color: var(--text-muted); font-weight: 400; }
-
-    /* Search bar */
-    .search-wrap {
-      flex: 1;
-      min-width: 200px;
-      position: relative;
-    }
-    .search-input {
-      width: 100%;
-      background: var(--surface2);
-      border: 1.5px solid var(--border);
-      border-radius: var(--radius-lg);
-      color: var(--text);
-      font-family: inherit;
-      font-size: 0.9rem;
-      padding: 10px 44px 10px 18px;
-      outline: none;
-      transition: border-color 0.2s, box-shadow 0.2s;
-    }
-    .search-input::placeholder { color: var(--text-dim); }
-    .search-input:focus {
-      border-color: var(--cyan);
-      box-shadow: 0 0 0 3px var(--cyan-dim);
-    }
-    .search-icon {
-      position: absolute;
-      right: 14px;
-      top: 50%;
-      transform: translateY(-50%);
-      color: var(--text-dim);
-      pointer-events: none;
-      font-size: 1rem;
-    }
-
-    /* Controls row */
-    .controls {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      padding-top: 12px;
-    }
-
-    /* Toggle pill */
-    .toggle-group {
-      display: flex;
-      background: var(--surface2);
-      border: 1.5px solid var(--border);
-      border-radius: var(--radius-lg);
-      overflow: hidden;
-      flex-shrink: 0;
-    }
-    .toggle-btn {
-      background: none;
-      border: none;
-      color: var(--text-muted);
-      font-family: inherit;
-      font-size: 0.8rem;
-      font-weight: 500;
-      padding: 7px 16px;
-      cursor: pointer;
-      transition: background 0.15s, color 0.15s;
-      white-space: nowrap;
-    }
-    .toggle-btn.active {
-      background: var(--cyan-dim);
-      color: var(--cyan);
-    }
-    .toggle-btn:hover:not(.active) { background: var(--surface3); color: var(--text); }
-
-    /* Platform filter chips */
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      border-radius: 99px;
-      padding: 5px 12px;
-      font-size: 0.78rem;
-      font-weight: 600;
-      cursor: pointer;
-      border: 1.5px solid transparent;
-      transition: all 0.15s;
-      flex-shrink: 0;
-    }
-    .chip-yt {
-      background: rgba(255,43,43,0.12);
-      color: var(--yt-red);
-      border-color: rgba(255,43,43,0.25);
-    }
-    .chip-yt.active, .chip-yt:hover {
-      background: rgba(255,43,43,0.22);
-      border-color: var(--yt-red);
-    }
-    .chip-tt {
-      background: rgba(77,196,230,0.12);
-      color: var(--tt-blue);
-      border-color: rgba(77,196,230,0.25);
-    }
-    .chip-tt.active, .chip-tt:hover {
-      background: rgba(77,196,230,0.22);
-      border-color: var(--tt-blue);
-    }
-    .chip-dot {
-      width: 7px; height: 7px;
-      border-radius: 50%;
-      background: currentColor;
-    }
-
-    /* Result count */
-    .result-meta {
-      margin-left: auto;
-      font-size: 0.78rem;
-      color: var(--text-dim);
-    }
-
-    /* ── Main Feed ─────────────────────────────── */
-    main {
-      grid-area: main;
-      padding: 8px 0 40px;
-    }
-
-    .section-title {
-      font-size: 0.7rem;
-      font-weight: 600;
-      letter-spacing: 1.5px;
-      text-transform: uppercase;
-      color: var(--text-dim);
-      margin-bottom: 14px;
-    }
-
-    /* Video grid */
-    .video-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-      gap: 16px;
-    }
-
-    /* Video card */
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      overflow: hidden;
-      cursor: pointer;
-      transition: transform 0.18s, border-color 0.18s, box-shadow 0.18s;
-      position: relative;
-    }
-    .card:hover {
-      transform: translateY(-3px);
-      border-color: var(--cyan);
-      box-shadow: 0 8px 32px rgba(6,214,214,0.12);
-    }
-
-    .card-thumb {
-      position: relative;
-      aspect-ratio: 16/9;
-      overflow: hidden;
-      background: var(--surface2);
-    }
-    .card-thumb.short { aspect-ratio: 9/16; max-height: 220px; }
-    .card-thumb img {
-      width: 100%; height: 100%;
-      object-fit: cover;
-      transition: transform 0.3s;
-    }
-    .card:hover .card-thumb img { transform: scale(1.04); }
-
-    /* Play overlay */
-    .play-overlay {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: rgba(0,0,0,0.3);
-      opacity: 0;
-      transition: opacity 0.18s;
-    }
-    .card:hover .play-overlay { opacity: 1; }
-    .play-btn {
-      width: 44px; height: 44px;
-      background: var(--cyan);
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 0 20px var(--cyan-glow);
-    }
-    .play-btn svg { fill: #000; margin-left: 3px; }
-
-    /* Duration badge */
-    .duration-badge {
-      position: absolute;
-      bottom: 8px; right: 8px;
-      background: rgba(0,0,0,0.75);
-      color: #fff;
-      font-size: 0.7rem;
-      font-weight: 600;
-      padding: 2px 7px;
-      border-radius: 4px;
-      backdrop-filter: blur(4px);
-    }
-
-    /* Platform bubble */
-    .platform-badge {
-      position: absolute;
-      top: 8px; left: 8px;
-      font-size: 0.65rem;
-      font-weight: 700;
-      padding: 3px 8px;
-      border-radius: 99px;
-    }
-    .platform-badge.yt {
-      background: var(--yt-red);
-      color: #fff;
-    }
-    .platform-badge.tt {
-      background: var(--tt-blue);
-      color: #000;
-    }
-
-    .card-body { padding: 12px; }
-    .card-title {
-      font-size: 0.88rem;
-      font-weight: 600;
-      line-height: 1.4;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-      color: var(--text);
-      margin-bottom: 6px;
-    }
-    .card-author {
-      font-size: 0.76rem;
-      color: var(--text-muted);
-      margin-bottom: 8px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .card-stats {
-      display: flex;
-      gap: 12px;
-      font-size: 0.72rem;
-      color: var(--text-dim);
-    }
-    .stat { display: flex; align-items: center; gap: 4px; }
-
-    /* Score bar */
-    .score-bar-wrap {
-      margin-top: 8px;
-      height: 2px;
-      background: var(--surface3);
-      border-radius: 99px;
-      overflow: hidden;
-    }
-    .score-bar {
-      height: 100%;
-      background: linear-gradient(90deg, var(--cyan), #0af);
-      border-radius: 99px;
-      transition: width 0.6s ease;
-    }
-
-    /* ── Sidebar / Recommendations ─────────────── */
-    .sidebar {
-      grid-area: sidebar;
-      padding: 24px 0 40px;
-    }
-    .rec-list { display: flex; flex-direction: column; gap: 10px; }
-
-    .rec-card {
-      display: flex;
-      gap: 10px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 8px;
-      cursor: pointer;
-      transition: border-color 0.15s, background 0.15s;
-    }
-    .rec-card:hover { border-color: var(--cyan); background: var(--surface2); }
-    .rec-thumb {
-      width: 80px;
-      aspect-ratio: 16/9;
-      border-radius: 6px;
-      overflow: hidden;
-      flex-shrink: 0;
-      background: var(--surface2);
-    }
-    .rec-thumb img { width: 100%; height: 100%; object-fit: cover; }
-    .rec-info { flex: 1; min-width: 0; }
-    .rec-title {
-      font-size: 0.78rem;
-      font-weight: 500;
-      line-height: 1.35;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-      margin-bottom: 4px;
-    }
-    .rec-author { font-size: 0.7rem; color: var(--text-muted); }
-    .rec-badge {
-      display: inline-block;
-      font-size: 0.6rem;
-      font-weight: 700;
-      padding: 1px 6px;
-      border-radius: 99px;
-      margin-top: 4px;
-    }
-    .rec-badge.yt { background: var(--yt-red); color: #fff; }
-    .rec-badge.tt { background: var(--tt-blue); color: #000; }
-
-    /* ── Modal player ──────────────────────────── */
-    .modal-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.85);
-      z-index: 200;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-      backdrop-filter: blur(6px);
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.2s;
-    }
-    .modal-overlay.open { opacity: 1; pointer-events: all; }
-
-    .modal {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      width: 100%;
-      max-width: 860px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      transform: scale(0.96);
-      transition: transform 0.2s;
-    }
-    .modal-overlay.open .modal { transform: scale(1); }
-
-    .modal-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      padding: 16px 20px 12px;
-      gap: 12px;
-    }
-    .modal-title { font-size: 0.95rem; font-weight: 600; line-height: 1.4; }
-    .modal-close {
-      background: none; border: none;
-      color: var(--text-muted);
-      font-size: 1.3rem;
-      cursor: pointer;
-      line-height: 1;
-      flex-shrink: 0;
-      padding: 2px 6px;
-      border-radius: 4px;
-    }
-    .modal-close:hover { background: var(--surface3); color: var(--text); }
-    .modal-player {
-      position: relative;
-      aspect-ratio: 16/9;
-      background: #000;
-    }
-    .modal-player.short-player { aspect-ratio: 9/16; max-height: 480px; }
-    .modal-player iframe {
-      width: 100%; height: 100%;
-      border: none;
-    }
-    .modal-meta {
-      padding: 12px 20px 16px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .modal-author { font-size: 0.82rem; color: var(--text-muted); }
-    .modal-stats { font-size: 0.78rem; color: var(--text-dim); margin-left: auto; }
-
-    /* ── States ────────────────────────────────── */
-    .loading {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 14px;
-      padding: 60px 0;
-      color: var(--text-muted);
-      font-size: 0.88rem;
-    }
-    .spinner {
-      width: 32px; height: 32px;
-      border: 3px solid var(--surface3);
-      border-top-color: var(--cyan);
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    .empty-state {
-      text-align: center;
-      padding: 60px 20px;
-      color: var(--text-muted);
-    }
-    .empty-state h3 { font-size: 1rem; margin-bottom: 8px; color: var(--text); }
-
-    /* ── Load more ─────────────────────────────── */
-    .load-more-wrap { text-align: center; margin-top: 28px; }
-    .load-more-btn {
-      background: var(--surface2);
-      border: 1.5px solid var(--border);
-      border-radius: var(--radius-lg);
-      color: var(--text-muted);
-      font-family: inherit;
-      font-size: 0.85rem;
-      font-weight: 500;
-      padding: 10px 28px;
-      cursor: pointer;
-      transition: border-color 0.15s, color 0.15s, background 0.15s;
-    }
-    .load-more-btn:hover {
-      border-color: var(--cyan);
-      color: var(--cyan);
-      background: var(--cyan-dim);
-    }
-
-    /* ── Divider ───────────────────────────────── */
-    .divider { height: 1px; background: var(--border); margin: 24px 0; }
-  </style>
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:3px}
+@media(max-width:700px){.header-inner{gap:10px}.main{padding:14px}.video-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}}
+</style>
 </head>
 <body>
 
-<div class="layout">
-
-  <!-- ── Header ──────────────────────────────── -->
-  <header>
-    <div class="header-inner">
-      <div class="logo">Stream<span>Hub</span></div>
-
-      <div class="search-wrap">
-        <input
-          id="searchInput"
-          class="search-input"
-          type="search"
-          placeholder="Search videos across YouTube &amp; TikTok…"
-          autocomplete="off"
-        />
-        <span class="search-icon">⌕</span>
+<header class="header">
+  <div class="header-inner">
+    <div class="logo">
+      <span class="logo-icon">▶</span>
+      <span class="logo-text">VidProxy</span>
+    </div>
+    <div class="search-wrap">
+      <div class="search-bar">
+        <svg class="s-icon" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+        </svg>
+        <input id="searchInput" type="text" placeholder="Search YouTube &amp; TikTok…" autocomplete="off"/>
+        <button id="searchBtn" class="btn-go">Search</button>
       </div>
     </div>
-
-    <div class="controls">
-      <!-- Short / Long form toggle -->
-      <div class="toggle-group" role="group" aria-label="Content type">
-        <button class="toggle-btn active" data-type="all">All</button>
-        <button class="toggle-btn" data-type="short">⚡ Short</button>
-        <button class="toggle-btn" data-type="long">▶ Long</button>
+    <div class="header-controls">
+      <div class="pill-group" id="platformGroup">
+        <button class="pill active" data-platform="all">All</button>
+        <button class="pill yt-pill" data-platform="youtube"><span class="badge yt-badge">YT</span> YouTube</button>
+        <button class="pill tt-pill" data-platform="tiktok"><span class="badge tt-badge">TT</span> TikTok</button>
       </div>
-
-      <!-- Platform filter -->
-      <div class="chip chip-yt active" data-platform="youtube">
-        <span class="chip-dot"></span> YouTube
+      <div class="pill-group" id="formGroup">
+        <button class="pill active" data-form="all">All</button>
+        <button class="pill" data-form="short">Short ≤60s</button>
+        <button class="pill" data-form="long">Long &gt;60s</button>
       </div>
-      <div class="chip chip-tt active" data-platform="tiktok">
-        <span class="chip-dot"></span> TikTok
+    </div>
+  </div>
+</header>
+
+<main class="main">
+  <div id="videoGrid" class="video-grid"></div>
+  <div id="loader" class="loader hidden">
+    <div class="spinner"></div><span>Fetching streams…</span>
+  </div>
+  <div id="emptyState" class="empty-state">
+    <div class="empty-icon">▶</div>
+    <p id="emptyMsg">Search for something to get started</p>
+  </div>
+</main>
+
+<div id="videoModal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-backdrop" id="modalBackdrop"></div>
+  <div class="modal-box">
+    <button class="modal-close" id="modalClose" aria-label="Close">✕</button>
+    <div class="modal-player"><video id="videoPlayer" controls playsinline></video></div>
+    <div class="modal-info">
+      <span class="modal-badge" id="modalBadge"></span>
+      <h2 class="modal-title" id="modalTitle"></h2>
+      <div class="modal-meta">
+        <span id="modalAuthor"></span>
+        <span class="sep" id="modalViewSep">·</span>
+        <span id="modalViews"></span>
+        <span class="sep" id="modalDurSep">·</span>
+        <span id="modalDur"></span>
       </div>
-
-      <span id="resultMeta" class="result-meta"></span>
-    </div>
-  </header>
-
-  <!-- ── Main Feed ────────────────────────────── -->
-  <main>
-    <p class="section-title">Top Videos</p>
-    <div id="videoGrid" class="video-grid"></div>
-    <div class="load-more-wrap" id="loadMoreWrap" style="display:none">
-      <button class="load-more-btn" id="loadMoreBtn">Load more</button>
-    </div>
-  </main>
-
-  <!-- ── Sidebar / Recommendations ────────────── -->
-  <aside class="sidebar">
-    <p class="section-title">Recommended</p>
-    <div id="recList" class="rec-list"></div>
-  </aside>
-
-</div>
-
-<!-- ── Modal Player ──────────────────────────── -->
-<div class="modal-overlay" id="modalOverlay">
-  <div class="modal" id="modal" role="dialog" aria-modal="true">
-    <div class="modal-header">
-      <p class="modal-title" id="modalTitle"></p>
-      <button class="modal-close" id="modalClose" aria-label="Close">✕</button>
-    </div>
-    <div class="modal-player" id="modalPlayer"></div>
-    <div class="modal-meta">
-      <span id="modalPlatformBadge"></span>
-      <span class="modal-author" id="modalAuthor"></span>
-      <span class="modal-stats" id="modalStats"></span>
+      <a id="modalLink" href="#" target="_blank" rel="noopener noreferrer" class="open-link">Open original ↗</a>
     </div>
   </div>
 </div>
 
 <script>
-(function () {
-  'use strict';
+(function(){
+'use strict';
+const $  = id => document.getElementById(id);
+const $$ = s  => document.querySelectorAll(s);
 
-  // ── State ──────────────────────────────────────
-  let allVideos   = [];
-  let displayed   = [];
-  let query       = 'trending';
-  let typeFilter  = 'all';
-  let platforms   = new Set(['youtube', 'tiktok']);
-  let page        = 0;
-  const PAGE_SIZE = 12;
-  let debounceTimer;
+const state = { query:'', platform:'all', form:'all', videos:[], loading:false };
 
-  // ── DOM refs ───────────────────────────────────
-  const grid        = document.getElementById('videoGrid');
-  const recList     = document.getElementById('recList');
-  const searchInput = document.getElementById('searchInput');
-  const resultMeta  = document.getElementById('resultMeta');
-  const loadMoreWrap= document.getElementById('loadMoreWrap');
-  const loadMoreBtn = document.getElementById('loadMoreBtn');
-  const overlay     = document.getElementById('modalOverlay');
-  const modal       = document.getElementById('modal');
-  const modalTitle  = document.getElementById('modalTitle');
-  const modalPlayer = document.getElementById('modalPlayer');
-  const modalClose  = document.getElementById('modalClose');
-  const modalAuthor = document.getElementById('modalAuthor');
-  const modalStats  = document.getElementById('modalStats');
-  const modalBadge  = document.getElementById('modalPlatformBadge');
+const searchInput   = $('searchInput');
+const searchBtn     = $('searchBtn');
+const videoGrid     = $('videoGrid');
+const loader        = $('loader');
+const emptyState    = $('emptyState');
+const emptyMsg      = $('emptyMsg');
+const videoModal    = $('videoModal');
+const videoPlayer   = $('videoPlayer');
+const modalClose    = $('modalClose');
+const modalBackdrop = $('modalBackdrop');
 
-  // ── Fetch feed ────────────────────────────────
-  async function fetchFeed() {
-    setLoading(true);
-    allVideos = []; displayed = []; page = 0;
+$$('#platformGroup .pill').forEach(b => b.addEventListener('click', () => {
+  $$('#platformGroup .pill').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  state.platform = b.dataset.platform;
+  if (state.query) doSearch();
+}));
 
-    try {
-      const params = new URLSearchParams({
-        q: query,
-        type: typeFilter,
-        limit: '40',
-      });
-      const resp = await fetch('/api/search?' + params);
-      if (!resp.ok) throw new Error('API error ' + resp.status);
-      const data = await resp.json();
-      allVideos = (data.results || []).filter(v =>
-        platforms.has(v.platform)
-      );
-    } catch (err) {
-      console.error(err);
-      allVideos = [];
-    }
+$$('#formGroup .pill').forEach(b => b.addEventListener('click', () => {
+  $$('#formGroup .pill').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  state.form = b.dataset.form;
+  renderGrid();
+}));
 
-    renderPage(true);
-    renderRecs();
-    setLoading(false);
+searchBtn.addEventListener('click', go);
+searchInput.addEventListener('keydown', e => { if(e.key==='Enter') go(); });
+function go(){ const q=searchInput.value.trim(); if(!q) return; state.query=q; doSearch(); }
+
+modalClose.addEventListener('click', closeModal);
+modalBackdrop.addEventListener('click', closeModal);
+document.addEventListener('keydown', e => { if(e.key==='Escape') closeModal(); });
+
+async function doSearch(){
+  if(state.loading) return;
+  state.loading = true;
+  videoGrid.innerHTML = '';
+  hideEmpty();
+  showLoader(true);
+  try{
+    const r = await fetch('/api/search?q='+encodeURIComponent(state.query)+'&type='+state.platform+'&limit=30');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const d = await r.json();
+    state.videos = d.videos || [];
+    renderGrid();
+  }catch(e){
+    console.error(e);
+    showEmpty('Search failed — check connection or try again.');
+  }finally{
+    state.loading = false;
+    showLoader(false);
   }
+}
 
-  // ── Render helpers ────────────────────────────
-  function renderPage(reset) {
-    if (reset) { grid.innerHTML = ''; page = 0; }
-    const start = page * PAGE_SIZE;
-    const slice = allVideos.slice(start, start + PAGE_SIZE);
-    slice.forEach(v => grid.appendChild(makeCard(v)));
-    displayed.push(...slice);
-    page++;
-    resultMeta.textContent = displayed.length + ' of ' + allVideos.length + ' results';
-    loadMoreWrap.style.display = displayed.length < allVideos.length ? '' : 'none';
-  }
+function renderGrid(){
+  videoGrid.innerHTML = '';
+  hideEmpty();
+  let list = [...state.videos];
+  if(state.form==='short') list = list.filter(v => v.durationSecs>0 && v.durationSecs<=60);
+  if(state.form==='long')  list = list.filter(v => v.durationSecs>60 || v.durationSecs===0);
+  if(!list.length){ showEmpty('No videos matched — try adjusting the filters.'); return; }
+  list.forEach(v => videoGrid.appendChild(makeCard(v)));
+}
 
-  function makeCard(v) {
-    const isShort = v.type === 'short';
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.setAttribute('role', 'article');
-    card.innerHTML = \`
-      <div class="card-thumb \${isShort ? 'short' : ''}">
-        <img
-          src="\${escHtml(v.thumbnail)}"
-          alt="\${escHtml(v.title)}"
-          loading="lazy"
-          onerror="this.src='https://picsum.photos/seed/\${escHtml(v.id)}/320/180'"
-        />
-        <div class="play-overlay">
-          <div class="play-btn">
-            <svg width="14" height="16" viewBox="0 0 14 16">
-              <path d="M0 0 L14 8 L0 16 Z"/>
-            </svg>
-          </div>
-        </div>
-        <span class="platform-badge \${v.platform === 'youtube' ? 'yt' : 'tt'}">
-          \${v.platform === 'youtube' ? 'YouTube' : 'TikTok'}
-        </span>
-        \${v.durationSec > 0 ? \`<span class="duration-badge">\${formatDuration(v.durationSec)}</span>\` : ''}
-      </div>
-      <div class="card-body">
-        <p class="card-title">\${escHtml(v.title)}</p>
-        <p class="card-author">\${escHtml(v.author)}</p>
-        <div class="card-stats">
-          <span class="stat">👁 \${fmtNum(v.stats?.views ?? v.views)}</span>
-          <span class="stat">♥ \${fmtNum(v.stats?.likes ?? v.likes)}</span>
-          <span class="stat">💬 \${fmtNum(v.stats?.comments ?? v.comments)}</span>
-        </div>
-        <div class="score-bar-wrap">
-          <div class="score-bar" style="width:\${Math.round((v.score || 0) * 100)}%"></div>
-        </div>
-      </div>
-    \`;
-    card.addEventListener('click', () => openPlayer(v));
-    return card;
-  }
+function makeCard(v){
+  const el   = document.createElement('div');
+  const plat = v.platform==='youtube' ? 'youtube' : 'tiktok';
+  const lbl  = v.platform==='youtube' ? 'YouTube'  : 'TikTok';
+  el.className = 'video-card'+(v.isShortForm?' short-form':'');
+  el.innerHTML =
+    '<div class="card-thumb">'+
+      '<img src="'+v.thumbnail+'" alt="" loading="lazy" onerror="this.src=\'data:image/svg+xml,<svg xmlns=\\\'http://www.w3.org/2000/svg\\\' width=\\\'320\\\' height=\\\'180\\\'/>\'" />'+
+      '<span class="card-plat '+plat+'">'+lbl+'</span>'+
+      (v.duration?'<span class="card-dur">'+esc(v.duration)+'</span>':'')+
+    '</div>'+
+    '<div class="card-body">'+
+      '<div class="card-title">'+esc(v.title)+'</div>'+
+      '<div class="card-meta"><span class="card-author">'+esc(v.author)+'</span><span class="card-views">'+esc(v.views)+' views</span></div>'+
+    '</div>';
+  el.addEventListener('click', () => openModal(v));
+  return el;
+}
 
-  function renderRecs() {
-    recList.innerHTML = '';
-    // Show top 8 videos (cross-platform) not yet in first page as recommendations
-    const recs = allVideos.slice(0, 8);
-    recs.forEach(v => {
-      const el = document.createElement('div');
-      el.className = 'rec-card';
-      el.innerHTML = \`
-        <div class="rec-thumb">
-          <img
-            src="\${escHtml(v.thumbnail)}"
-            alt=""
-            loading="lazy"
-            onerror="this.src='https://picsum.photos/seed/r\${escHtml(v.id)}/80/45'"
-          />
-        </div>
-        <div class="rec-info">
-          <p class="rec-title">\${escHtml(v.title)}</p>
-          <p class="rec-author">\${escHtml(v.author)}</p>
-          <span class="rec-badge \${v.platform === 'youtube' ? 'yt' : 'tt'}">
-            \${v.platform === 'youtube' ? 'YT' : 'TT'}
-          </span>
-        </div>
-      \`;
-      el.addEventListener('click', () => openPlayer(v));
-      recList.appendChild(el);
-    });
-  }
+function openModal(v){
+  const plat = v.platform==='youtube' ? 'youtube' : 'tiktok';
+  const lbl  = v.platform==='youtube' ? 'YouTube'  : 'TikTok';
+  const badge = $('modalBadge');
+  badge.className = 'modal-badge '+plat;
+  badge.textContent = lbl;
+  $('modalTitle').textContent  = v.title;
+  $('modalAuthor').textContent = v.author;
+  $('modalViews').textContent  = v.views+' views';
+  const durEl = $('modalDur'), durSep = $('modalDurSep');
+  if(v.duration){ durEl.textContent=v.duration; durEl.style.display=durSep.style.display=''; }
+  else          { durEl.style.display=durSep.style.display='none'; }
+  $('modalLink').href = v.url;
+  videoPlayer.src = v.streamUrl;
+  videoPlayer.load();
+  videoPlayer.play().catch(()=>{});
+  videoModal.classList.remove('hidden');
+  document.body.style.overflow='hidden';
+}
 
-  // ── Modal player ──────────────────────────────
-  function openPlayer(v) {
-    modalTitle.textContent = v.title;
-    modalAuthor.textContent = '@ ' + v.author;
-    modalStats.textContent = \`\${fmtNum(v.stats?.views ?? v.views)} views · \${fmtNum(v.stats?.likes ?? v.likes)} likes\`;
+function closeModal(){
+  videoModal.classList.add('hidden');
+  videoPlayer.pause();
+  videoPlayer.src='';
+  document.body.style.overflow='';
+}
 
-    modalBadge.className = 'chip ' + (v.platform === 'youtube' ? 'chip-yt' : 'chip-tt');
-    modalBadge.innerHTML = \`<span class="chip-dot"></span> \${v.platform === 'youtube' ? 'YouTube' : 'TikTok'}\`;
+function showLoader(on){ loader.classList.toggle('hidden',!on); }
+function showEmpty(msg){ emptyMsg.textContent=msg||'No results'; emptyState.classList.remove('hidden'); }
+function hideEmpty(){ emptyState.classList.add('hidden'); }
+function esc(s){ return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-    modalPlayer.className = 'modal-player' + (v.type === 'short' ? ' short-player' : '');
-    modalPlayer.innerHTML = \`<iframe
-      src="\${escHtml(v.embedUrl)}"
-      allowfullscreen
-      allow="autoplay; encrypted-media; picture-in-picture"
-      referrerpolicy="no-referrer"
-    ></iframe>\`;
-
-    overlay.classList.add('open');
-    document.body.style.overflow = 'hidden';
-    modalClose.focus();
-  }
-
-  function closePlayer() {
-    overlay.classList.remove('open');
-    document.body.style.overflow = '';
-    modalPlayer.innerHTML = '';
-  }
-
-  // ── Loading state ─────────────────────────────
-  function setLoading(isLoading) {
-    if (isLoading) {
-      grid.innerHTML = \`
-        <div class="loading" style="grid-column:1/-1">
-          <div class="spinner"></div>
-          <span>Fetching from YouTube &amp; TikTok…</span>
-        </div>
-      \`;
-    } else if (allVideos.length === 0 && !isLoading) {
-      grid.innerHTML = \`
-        <div class="empty-state" style="grid-column:1/-1">
-          <h3>No results found</h3>
-          <p>Try a different search term or toggle the filters.</p>
-        </div>
-      \`;
-    }
-  }
-
-  // ── Event listeners ───────────────────────────
-  searchInput.addEventListener('input', (e) => {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      query = e.target.value.trim() || 'trending';
-      fetchFeed();
-    }, 500);
-  });
-
-  searchInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      clearTimeout(debounceTimer);
-      query = e.target.value.trim() || 'trending';
-      fetchFeed();
-    }
-  });
-
-  document.querySelectorAll('.toggle-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      typeFilter = btn.dataset.type;
-      fetchFeed();
-    });
-  });
-
-  document.querySelectorAll('.chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      const p = chip.dataset.platform;
-      if (platforms.has(p)) {
-        if (platforms.size > 1) { platforms.delete(p); chip.classList.remove('active'); }
-      } else {
-        platforms.add(p); chip.classList.add('active');
-      }
-      // Re-filter without re-fetching
-      const filtered = allVideos.filter(v => platforms.has(v.platform));
-      grid.innerHTML = '';
-      page = 0;
-      displayed = [];
-      filtered.slice(0, PAGE_SIZE).forEach(v => grid.appendChild(makeCard(v)));
-      displayed = filtered.slice(0, PAGE_SIZE);
-      page = 1;
-      resultMeta.textContent = displayed.length + ' of ' + filtered.length + ' results';
-      loadMoreWrap.style.display = displayed.length < filtered.length ? '' : 'none';
-    });
-  });
-
-  loadMoreBtn.addEventListener('click', () => renderPage(false));
-
-  modalClose.addEventListener('click', closePlayer);
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) closePlayer(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePlayer(); });
-
-  // ── Utility ───────────────────────────────────
-  function escHtml(str) {
-    return String(str ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
-  function fmtNum(n) {
-    if (n == null) return '—';
-    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-    return String(n);
-  }
-
-  function formatDuration(sec) {
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = sec % 60;
-    if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
-    return m + ':' + String(s).padStart(2, '0');
-  }
-
-  // ── Boot ──────────────────────────────────────
-  fetchFeed();
-
+window.addEventListener('load', () => { state.query='trending'; searchInput.value='trending'; doSearch(); });
 })();
 </script>
 </body>
 </html>`;
+
+/* ═══════════════════════════════════════════════════════════
+   SECTION 7 — SHARED HELPERS
+   ═══════════════════════════════════════════════════════════ */
+
+function parseViews(t) {
+  if (!t) return 0;
+  t = t.replace(/,/g, '').replace(/\s*views?/i, '').trim();
+  if (t.endsWith('B')) return parseFloat(t) * 1e9;
+  if (t.endsWith('M')) return parseFloat(t) * 1e6;
+  if (t.endsWith('K')) return parseFloat(t) * 1e3;
+  return parseInt(t) || 0;
+}
+function parseDur(t) {
+  if (!t) return 0;
+  const p = t.split(':').map(Number);
+  if (p.length === 3) return p[0]*3600 + p[1]*60 + p[2];
+  if (p.length === 2) return p[0]*60   + p[1];
+  return p[0] || 0;
+}
+function fmtDurSecs(s) {
+  if (!s) return '';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
+    : `${m}:${String(ss).padStart(2,'0')}`;
+}
+function fmtNum(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(1)+'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SECTION 8 — MAIN FETCH HANDLER  (CF Worker entry point)
+   ═══════════════════════════════════════════════════════════ */
+
+export default {
+  async fetch(request, env) {
+    const url    = new URL(request.url);
+    const path   = url.pathname;
+    const TOP_N  = parseInt(env.TOP_N ?? '24', 10);
+
+    /* ── Web client ───────────────────────────────────── */
+    if (path === '/' || path === '/index.html') {
+      return new Response(HTML, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+    }
+
+    /* ── Search ───────────────────────────────────────── */
+    if (path === '/api/search') {
+      const q    = url.searchParams.get('q');
+      const type = url.searchParams.get('type') || 'all';
+      const limit= parseInt(url.searchParams.get('limit') || TOP_N, 10);
+      if (!q) return json({ error: 'Query required' }, 400);
+
+      /* Grabber — with automatic failover to Backup Proxy on 500 */
+      let raw = [];
+      try {
+        const [yt, tt] = await Promise.all([
+          (type === 'all' || type === 'youtube')
+            ? grabYouTube(q).catch(e => { if (e.status >= 500) throw e; return []; })
+            : Promise.resolve([]),
+          (type === 'all' || type === 'tiktok')
+            ? grabTikTok(q).catch(() => [])
+            : Promise.resolve([]),
+        ]);
+        raw = [...yt, ...tt];
+      } catch (err) {
+        /* 500 on primary → Backup Proxy (bidirectional failover) */
+        console.error('[Worker] Primary grabber 500 — activating backup proxy:', err.message);
+        const [yt, tt] = await Promise.all([
+          (type === 'all' || type === 'youtube') ? backupYouTube(q).catch(() => []) : [],
+          (type === 'all' || type === 'tiktok')  ? backupTikTok(q).catch(() => [])  : [],
+        ]);
+        raw = [...yt, ...tt];
+      }
+
+      const ranked  = aggregate(raw, limit);   // Aggregator
+      const payload = formatPayload(ranked);   // Sender
+      return json(payload);
+    }
+
+    /* ── Stream proxy ─────────────────────────────────── */
+    if (path.startsWith('/api/stream/')) {
+      const [, , , platform, videoId] = path.split('/');
+      if (!platform || !videoId) return json({ error: 'Invalid stream path' }, 400);
+      const range = request.headers.get('range') || undefined;
+
+      if (platform === 'youtube') return proxyYTStream(videoId, range);
+      if (platform === 'tiktok')  return proxyTTStream(videoId, range);
+      return json({ error: 'Unknown platform' }, 400);
+    }
+
+    /* ── Thumbnail proxy ──────────────────────────────── */
+    if (path === '/api/thumb') {
+      const rawUrl = url.searchParams.get('url');
+      if (!rawUrl) return new Response(null, { status: 400 });
+      return proxyThumbnail(rawUrl);
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+};
