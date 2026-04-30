@@ -1,0 +1,7 @@
+name = "vidproxy"
+main = "worker.js"
+compatibility_date = "2024-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+TOP_N = "24"
