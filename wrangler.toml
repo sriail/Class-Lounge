@@ -1,7 +1,6 @@
-name = "vidproxy"
-main = "worker.js"
-compatibility_date = "2024-04-01"
-compatibility_flags = ["nodejs_compat"]
+name = "yt-worker"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
 
 [vars]
-TOP_N = "24"
+INVIDIOUS_HOST = "https://inv.nadeko.net"
