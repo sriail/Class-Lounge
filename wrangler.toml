@@ -1,10 +1,14 @@
-name = "yt-stream-proxy"
+name = "yt-tt-stream-proxy"
 main = "worker.js"
 compatibility_date = "2024-05-01"
 
-# ── Optional: KV cache for /info responses (avoids repeat InnerTube calls)
-# 1. Run: wrangler kv:namespace create CACHE
-# 2. Paste the returned id below, then uncomment:
+# ── Optional KV cache (reduces API calls significantly)
+# 1. wrangler kv:namespace create CACHE
+# 2. Paste the id below and uncomment:
 # [[kv_namespaces]]
 # binding = "CACHE"
-# id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+# id = "YOUR_KV_NAMESPACE_ID"
+
+# ── Optional: TikTok msToken cookie (improves search reliability)
+# [vars]
+# TIKTOK_MSTOKEN = "paste_your_mstoken_here"
