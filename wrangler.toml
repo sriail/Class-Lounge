@@ -2,10 +2,9 @@ name = "yt-stream-proxy"
 main = "worker.js"
 compatibility_date = "2024-05-01"
 
-# Uncomment to enable KV caching of /info responses (optional)
+# ── Optional: KV cache for /info responses (avoids repeat InnerTube calls)
+# 1. Run: wrangler kv:namespace create CACHE
+# 2. Paste the returned id below, then uncomment:
 # [[kv_namespaces]]
 # binding = "CACHE"
-# id = "YOUR_KV_NAMESPACE_ID"
-
-[vars]
-# Add any env vars here if needed
+# id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
