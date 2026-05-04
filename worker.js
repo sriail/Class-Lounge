@@ -2,10 +2,10 @@
 //  Cloudflare Worker — YouTube + TikTok Stream Proxy
 //  Routes:
 //    GET /              → serve UI
-//    GET /yt/search?q=  → YouTube InnerTube search
+//    GET /yt/search?q=  → YouTube search
 //    GET /yt/info?v=    → YouTube video streams
 //    GET /tt/search?q=  → TikTok search
-//    GET /tt/info?url=  → TikTok single video info
+//    GET /tt/info?url=  → TikTok single video
 //    GET /stream?p=&url=→ proxy stream (p=yt|tt)
 //    GET /proxy?url=    → proxy images/thumbnails
 // ============================================================
@@ -65,14 +65,14 @@ async function handleYTSearch(url, env) {
     },
     body: JSON.stringify({
       query: q,
-      params: 'EgIQAQ==', // videos only
+      params: 'EgIQAQ==',
       context: {
         client: { clientName: 'WEB', clientVersion: '2.20240101.00.00', hl: 'en', gl: 'US' },
       },
     }),
   });
 
-  if (!res.ok) return jsonResponse({ error: `YT search ${res.status}`, results: [] }, 200);
+  if (!res.ok) return jsonResponse({ results: [], error: `YT search ${res.status}` }, 200);
   const data = await res.json();
   const results = parseYTSearchResults(data, url.origin);
   const payload = { results };
@@ -109,7 +109,7 @@ function parseYTSearchResults(data, origin) {
 
 // ══════════════════════════════════════════════════════════════
 //  YouTube — Player Info
-// ══════════════════════════════════════════════════════════════
+// ══════════��═══════════════════════════════════════════════════
 async function handleYTInfo(url, env) {
   const videoId = url.searchParams.get('v');
   if (!videoId) return jsonResponse({ error: 'Missing ?v=' }, 400);
@@ -237,12 +237,11 @@ async function handleTTSearch(url, env) {
   if (data.status_code !== 0)
     return jsonResponse({
       results: [], hasMore: false,
-      error: `TikTok API status ${data.status_code} — may need TIKTOK_MSTOKEN env var`,
+      error: `TikTok API status ${data.status_code} — set TIKTOK_MSTOKEN env var`,
     }, 200);
 
   const results = parseTTResults(data, url.origin);
   const payload = { results, nextCursor: data.cursor ?? null, hasMore: data.has_more === 1 };
-
   if (env.CACHE && results.length)
     await env.CACHE.put(cacheKey, JSON.stringify(payload), { expirationTtl: 300 });
   return jsonResponse(payload);
@@ -254,14 +253,12 @@ function parseTTResults(data, origin) {
     const v  = item.item ?? item;
     const id = v.id ?? v.aweme_id;
     if (!id) continue;
-
     const vid    = v.video  ?? {};
     const auth   = v.author ?? {};
     const plays  = vid.play_addr?.url_list ?? vid.download_addr?.url_list ?? [];
     const covers = vid.cover?.url_list ?? vid.origin_cover?.url_list ?? [];
     const play   = plays[0] ?? '';
     if (!play) continue;
-
     out.push({
       platform:     'tiktok',
       id,
@@ -279,7 +276,7 @@ function parseTTResults(data, origin) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  TikTok — Single Video Info (from full URL or short URL)
+//  TikTok — Single Video Info
 // ══════════════════════════════════════════════════════════════
 async function handleTTInfo(url, env) {
   const videoUrl = url.searchParams.get('url');
@@ -291,7 +288,6 @@ async function handleTTInfo(url, env) {
     if (hit) return jsonResponse(hit);
   }
 
-  // Resolve short links
   let resolved = videoUrl;
   try {
     const u = new URL(videoUrl);
@@ -312,7 +308,6 @@ async function handleTTInfo(url, env) {
 
   if (!res.ok) return jsonResponse({ error: `TikTok page ${res.status}` }, 502);
   const html = await res.text();
-
   const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">(.+?)<\/script>/s);
   if (!match) return jsonResponse({ error: 'Could not find __NEXT_DATA__' }, 502);
 
@@ -327,9 +322,7 @@ async function handleTTInfo(url, env) {
   const auth = item.author ?? {};
   const plays =
     vid.bitrateInfo?.flatMap(b => b.PlayAddr?.UrlList ?? []) ??
-    (vid.playAddr ? [vid.playAddr] : []) ??
-    vid.play_addr?.url_list ?? [];
-
+    (vid.playAddr ? [vid.playAddr] : []);
   const cover = vid.cover ?? vid.dynamicCover ?? '';
 
   const payload = {
@@ -371,7 +364,6 @@ async function handleStream(request, url) {
   if (range) upHeaders['Range'] = range;
 
   const upstream = await fetch(targetUrl.toString(), { headers: upHeaders });
-
   const respHeaders = new Headers();
   for (const k of ['Content-Type','Content-Length','Content-Range','Accept-Ranges','Last-Modified','ETag']) {
     const v = upstream.headers.get(k);
@@ -383,7 +375,7 @@ async function handleStream(request, url) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Image / Thumbnail Proxy
+//  Image Proxy
 // ══════════════════════════════════════════════════════════════
 async function handleProxy(url) {
   const target = url.searchParams.get('url');
@@ -417,13 +409,12 @@ async function handleProxy(url) {
 function isTrustedOrigin(url, platform) {
   const h = url.hostname;
   return platform === 'tt'
-    ? h.endsWith('.tiktok.com')    || h.endsWith('.tiktokv.com')      ||
-      h.endsWith('.muscdn.com')    || h.endsWith('.tiktokcdn.com')     ||
+    ? h.endsWith('.tiktok.com') || h.endsWith('.tiktokv.com') ||
+      h.endsWith('.muscdn.com') || h.endsWith('.tiktokcdn.com') ||
       h.endsWith('.tiktokcdn-us.com')
-    : h.endsWith('.googlevideo.com') || h.endsWith('.youtube.com')    ||
+    : h.endsWith('.googlevideo.com') || h.endsWith('.youtube.com') ||
       h.endsWith('.ytimg.com')       || h.endsWith('.ggpht.com');
 }
-
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -436,9 +427,11 @@ function htmlResponse(html) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ══════════════════════════════════════════════════════════════
-//  Client UI
+//  Client HTML — defined as a regular string to avoid backtick
+//  collisions inside the template.  All inner backticks are
+//  escaped with \`.
 // ══════════════════════════════════════════════════════════════
-const CLIENT_HTML = /* html */`<!DOCTYPE html>
+const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
@@ -447,77 +440,529 @@ const CLIENT_HTML = /* html */`<!DOCTYPE html>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     :root{
-      --bg:#0a0a0a; --surface:#161616; --border:#252525;
-      --text:#f0f0f0; --muted:#777;
-      --yt:#ff0000; --tt:#fe2c55; --accent:#ff4545;
+      --bg:#0a0a0a;--surface:#161616;--border:#252525;
+      --text:#f0f0f0;--muted:#777;
+      --yt:#ff0000;--tt:#fe2c55;--accent:#ff4545;
       --r:10px;
     }
     html,body{height:100%;background:var(--bg);color:var(--text);
       font-family:system-ui,-apple-system,sans-serif;overflow:hidden}
 
-    /* ── App shell ── */
+    /* App shell */
     .app{display:flex;flex-direction:column;height:100dvh}
 
     header{
-      flex-shrink:0;display:flex;flex-direction:column;gap:.6rem;
-      padding:.65rem 1rem;background:var(--surface);
+      flex-shrink:0;display:flex;flex-direction:column;gap:.55rem;
+      padding:.6rem 1rem;background:var(--surface);
       border-bottom:1px solid var(--border);z-index:10
     }
-    .header-row{display:flex;gap:.5rem;align-items:center}
+    .hrow{display:flex;gap:.5rem;align-items:center}
 
-    /* ── Tabs ── */
+    /* Tabs */
     .tab{
-      display:flex;align-items:center;gap:.35rem;
-      padding:.38rem .9rem;border-radius:20px;
+      display:flex;align-items:center;gap:.3rem;
+      padding:.35rem .85rem;border-radius:20px;
       border:1px solid var(--border);background:transparent;
-      color:var(--muted);font-size:.85rem;cursor:pointer;transition:all .2s;
-      white-space:nowrap
+      color:var(--muted);font-size:.82rem;cursor:pointer;transition:all .18s;white-space:nowrap
     }
     .tab.yt-active{background:var(--yt);border-color:var(--yt);color:#fff}
     .tab.tt-active{background:var(--tt);border-color:var(--tt);color:#fff}
     .tab:not(.yt-active):not(.tt-active):hover{border-color:#555;color:var(--text)}
 
-    /* ── Inputs ── */
+    /* Inputs */
     input{
-      flex:1;padding:.5rem .85rem;border-radius:8px;
+      flex:1;padding:.48rem .85rem;border-radius:8px;
       border:1px solid var(--border);background:#1c1c1c;
-      color:var(--text);font-size:.92rem;outline:none;transition:border-color .2s
+      color:var(--text);font-size:.9rem;outline:none;transition:border-color .2s
     }
     input:focus{border-color:var(--accent)}
-    input.filter{font-size:.82rem;color:var(--muted)}
-    input.filter:focus{color:var(--text)}
 
     .btn{
-      padding:.5rem 1rem;border-radius:8px;border:none;
-      background:var(--accent);color:#fff;font-size:.88rem;
-      cursor:pointer;white-space:nowrap;transition:background .2s;flex-shrink:0
+      padding:.48rem 1rem;border-radius:8px;border:none;
+      background:var(--accent);color:#fff;font-size:.86rem;
+      cursor:pointer;white-space:nowrap;transition:background .18s;flex-shrink:0
     }
     .btn:hover{background:#d93030}
-    .btn:disabled{background:#3a3a3a;cursor:not-allowed}
+    .btn:disabled{background:#333;cursor:not-allowed}
 
-    #status{
-      font-size:.78rem;color:var(--muted);
-      padding:.1rem 1rem .3rem;min-height:1.1em;flex-shrink:0
-    }
+    #status{font-size:.76rem;color:var(--muted);padding:.05rem 0 .2rem;min-height:1em}
     #status.err{color:#ff6b6b}
 
-    /* ── Panels ── */
+    /* Panels */
     .panels{flex:1;overflow:hidden;position:relative}
     .panel{position:absolute;inset:0;overflow-y:auto;transition:opacity .18s,transform .18s}
-    .panel.gone{opacity:0;pointer-events:none;transform:translateX(20px)}
+    .panel.gone{opacity:0;pointer-events:none;transform:translateX(18px)}
 
-    /* ── YouTube panel ── */
-    #yt-panel{padding:1rem;display:flex;flex-direction:column;gap:1rem}
+    /* ───── YouTube panel ───── */
+    #yt-panel{padding:.9rem;display:flex;flex-direction:column;gap:.9rem}
 
-    /* Player */
     .yt-player{
       background:var(--surface);border:1px solid var(--border);
       border-radius:var(--r);overflow:hidden;display:none;flex-direction:column
     }
     .yt-player video{width:100%;aspect-ratio:16/9;background:#000;display:block}
-    .yt-meta{padding:.7rem 1rem;display:flex;flex-direction:column;gap:.45rem}
-    .yt-title{font-size:.98rem;font-weight:600;line-height:1.35}
-    .yt-author{font-size:.78rem;color:var(--muted)}
-    .sGrid{display:flex;flex-wrap:wrap;gap:.35rem;padding:.1rem 0 .3rem}
+    .yt-meta{padding:.65rem .9rem;display:flex;flex-direction:column;gap:.35rem}
+    .yt-title{font-size:.95rem;font-weight:600;line-height:1.35}
+    .yt-author{font-size:.76rem;color:var(--muted)}
+    .sGrid{display:flex;flex-wrap:wrap;gap:.3rem;padding:.1rem 0 .4rem}
     .sBtn{
-      
+      padding:.28rem .65rem;font-size:.75rem;border-radius:6px;
+      border:1px solid var(--border);background:var(--surface);
+      color:#ccc;cursor:pointer;transition:all .15s
+    }
+    .sBtn:hover,.sBtn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+
+    .yt-results{display:flex;flex-direction:column;gap:.6rem}
+    .yt-card{
+      display:flex;gap:.75rem;align-items:flex-start;
+      background:var(--surface);border:1px solid var(--border);
+      border-radius:var(--r);padding:.6rem;cursor:pointer;transition:border-color .15s
+    }
+    .yt-card:hover{border-color:#444}
+    .yt-card.hidden{display:none}
+    .yt-thumb-wrap{position:relative;flex-shrink:0;width:130px}
+    .yt-thumb-wrap img{width:130px;aspect-ratio:16/9;object-fit:cover;border-radius:6px;display:block}
+    .yt-dur{
+      position:absolute;bottom:4px;right:4px;
+      background:rgba(0,0,0,.8);color:#fff;font-size:.68rem;
+      padding:.12rem .35rem;border-radius:4px
+    }
+    .yt-card-text{display:flex;flex-direction:column;gap:.25rem;min-width:0}
+    .yt-card-title{font-size:.85rem;font-weight:500;line-height:1.35;
+      display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+    .yt-card-meta{font-size:.73rem;color:var(--muted)}
+
+    /* ───── TikTok panel ───── */
+    #tt-panel{display:flex;flex-direction:column}
+
+    .tt-feed{
+      flex:1;overflow-y:scroll;scroll-snap-type:y mandatory;
+      height:calc(100dvh - var(--header-h, 130px));
+      display:flex;flex-direction:column
+    }
+    .tt-results-grid{
+      flex-shrink:0;display:grid;
+      grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
+      gap:.5rem;padding:.8rem
+    }
+    .tt-thumb-card{
+      cursor:pointer;border-radius:8px;overflow:hidden;
+      background:var(--surface);border:1px solid var(--border);
+      transition:border-color .15s;position:relative
+    }
+    .tt-thumb-card:hover{border-color:#555}
+    .tt-thumb-card.hidden{display:none}
+    .tt-thumb-card img{width:100%;aspect-ratio:9/16;object-fit:cover;display:block}
+    .tt-thumb-card .tt-card-title{
+      position:absolute;bottom:0;left:0;right:0;
+      padding:.35rem .4rem;font-size:.7rem;line-height:1.3;
+      background:linear-gradient(transparent,rgba(0,0,0,.85));
+      color:#fff;display:-webkit-box;-webkit-line-clamp:2;
+      -webkit-box-orient:vertical;overflow:hidden
+    }
+    .tt-card-author{
+      position:absolute;top:5px;left:5px;
+      background:rgba(0,0,0,.6);color:#fff;font-size:.65rem;
+      padding:.1rem .35rem;border-radius:10px
+    }
+
+    /* Vertical snap feed (active video playback) */
+    .tt-slide{
+      flex-shrink:0;height:calc(100dvh - var(--header-h,130px));
+      scroll-snap-align:start;position:relative;
+      background:#000;display:flex;align-items:center;justify-content:center
+    }
+    .tt-slide video{
+      max-width:100%;max-height:100%;object-fit:contain;display:block
+    }
+    .tt-slide-info{
+      position:absolute;bottom:0;left:0;right:0;
+      padding:.75rem;background:linear-gradient(transparent,rgba(0,0,0,.75));
+      pointer-events:none
+    }
+    .tt-slide-title{font-size:.82rem;line-height:1.35;margin-bottom:.2rem;
+      display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+    .tt-slide-author{font-size:.73rem;color:#ccc}
+
+    /* Load more */
+    .load-more{
+      margin:.6rem auto;padding:.45rem 1.2rem;border-radius:20px;
+      border:1px solid var(--border);background:transparent;
+      color:var(--muted);font-size:.82rem;cursor:pointer;transition:all .18s
+    }
+    .load-more:hover{border-color:#555;color:var(--text)}
+
+    /* Empty / error states */
+    .empty{
+      text-align:center;color:var(--muted);font-size:.85rem;
+      padding:3rem 1rem;line-height:1.8
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header id="header">
+    <div class="hrow">
+      <button class="tab yt-active" id="tab-yt">&#9654; YouTube</button>
+      <button class="tab" id="tab-tt">&#9654; TikTok</button>
+      <input id="search-input" placeholder="Search videos…" autocomplete="off" style="margin-left:.25rem"/>
+      <button class="btn" id="search-btn">Search</button>
+    </div>
+    <div class="hrow">
+      <input id="filter-input" placeholder="Filter results by title…" style="font-size:.8rem;color:var(--muted)"/>
+    </div>
+    <div id="status"></div>
+  </header>
+
+  <div class="panels">
+    <div class="panel" id="yt-panel">
+      <div class="yt-player" id="yt-player">
+        <video id="yt-video" controls crossorigin="anonymous"></video>
+        <div class="yt-meta">
+          <div class="yt-title" id="yt-title"></div>
+          <div class="yt-author" id="yt-author"></div>
+          <div class="sGrid" id="yt-sgrid"></div>
+        </div>
+      </div>
+      <div class="yt-results" id="yt-results"></div>
+    </div>
+
+    <div class="panel gone" id="tt-panel">
+      <!-- grid view (search results) -->
+      <div class="tt-results-grid" id="tt-grid"></div>
+      <button class="load-more" id="tt-more" style="display:none">Load more</button>
+      <!-- vertical snap feed -->
+      <div class="tt-feed" id="tt-feed" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  // ── refs ─────────────────────────────────────────────────
+  const tabYT      = document.getElementById('tab-yt');
+  const tabTT      = document.getElementById('tab-tt');
+  const searchInp  = document.getElementById('search-input');
+  const searchBtn  = document.getElementById('search-btn');
+  const filterInp  = document.getElementById('filter-input');
+  const statusEl   = document.getElementById('status');
+  const ytPanel    = document.getElementById('yt-panel');
+  const ttPanel    = document.getElementById('tt-panel');
+  const ytPlayer   = document.getElementById('yt-player');
+  const ytVideo    = document.getElementById('yt-video');
+  const ytTitle    = document.getElementById('yt-title');
+  const ytAuthor   = document.getElementById('yt-author');
+  const ytSgrid    = document.getElementById('yt-sgrid');
+  const ytResults  = document.getElementById('yt-results');
+  const ttGrid     = document.getElementById('tt-grid');
+  const ttFeed     = document.getElementById('tt-feed');
+  const ttMore     = document.getElementById('tt-more');
+  const header     = document.getElementById('header');
+
+  let activePlatform = 'yt';
+  let ttCursor       = '0';
+  let ttHasMore      = false;
+  let ttQuery        = '';
+  let ttItems        = [];   // all loaded TT search results
+  let ttFeedItems    = [];   // items currently in the snap feed
+
+  // ── header height CSS var (for tt-feed height calc) ──────
+  function updateHeaderHeight(){
+    document.documentElement.style.setProperty('--header-h', header.offsetHeight + 'px');
+  }
+  new ResizeObserver(updateHeaderHeight).observe(header);
+  updateHeaderHeight();
+
+  // ── tab switching ────────────────────────────────────────
+  tabYT.addEventListener('click', () => switchTab('yt'));
+  tabTT.addEventListener('click', () => switchTab('tt'));
+
+  function switchTab(p){
+    activePlatform = p;
+    tabYT.className = 'tab' + (p==='yt' ? ' yt-active' : '');
+    tabTT.className = 'tab' + (p==='tt' ? ' tt-active' : '');
+    ytPanel.classList.toggle('gone', p !== 'yt');
+    ttPanel.classList.toggle('gone', p !== 'tt');
+    clearStatus();
+    // apply existing filter to newly visible panel
+    applyFilter(filterInp.value);
+  }
+
+  // ── search ───────────────────────────────────────────────
+  searchBtn.addEventListener('click', doSearch);
+  searchInp.addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
+
+  async function doSearch(){
+    const q = searchInp.value.trim();
+    if(!q) return;
+    searchBtn.disabled = true;
+    setStatus('Searching…');
+    filterInp.value = '';
+
+    if(activePlatform === 'yt'){
+      await searchYT(q);
+    } else {
+      ttQuery   = q;
+      ttCursor  = '0';
+      ttItems   = [];
+      ttFeed.style.display  = 'none';
+      ttGrid.style.display  = '';
+      ttGrid.innerHTML      = '';
+      await loadMoreTT();
+    }
+    searchBtn.disabled = false;
+  }
+
+  // ── YouTube search ───────────────────────────────────────
+  async function searchYT(q){
+    try {
+      const res  = await fetch('/yt/search?q=' + encodeURIComponent(q));
+      const data = await res.json();
+      if(data.error && !data.results?.length){ setStatus('YT: ' + data.error, true); return; }
+      renderYTResults(data.results ?? []);
+      setStatus(data.results?.length ? '' : 'No results');
+    } catch(e){ setStatus('Error: ' + e.message, true); }
+  }
+
+  function renderYTResults(items){
+    ytResults.innerHTML = '';
+    ytPlayer.style.display = 'none';
+    if(!items.length){ ytResults.innerHTML = '<div class="empty">No YouTube results found.</div>'; return; }
+
+    items.forEach(v => {
+      const card = document.createElement('div');
+      card.className   = 'yt-card';
+      card.dataset.title = (v.title||'').toLowerCase();
+      card.innerHTML =
+        '<div class="yt-thumb-wrap">' +
+          '<img src="/proxy?url=' + encodeURIComponent(v.thumbnail) + '" alt="" loading="lazy"/>' +
+          '<span class="yt-dur">' + esc(v.duration) + '</span>' +
+        '</div>' +
+        '<div class="yt-card-text">' +
+          '<div class="yt-card-title">' + esc(v.title) + '</div>' +
+          '<div class="yt-card-meta">' + esc(v.author) + ' &middot; ' + esc(v.views) + '</div>' +
+        '</div>';
+      card.addEventListener('click', () => loadYTVideo(v));
+      ytResults.appendChild(card);
+    });
+  }
+
+  async function loadYTVideo(v){
+    setStatus('Loading player…');
+    try {
+      const res  = await fetch(v.infoUrl);
+      const data = await res.json();
+      if(!res.ok || !data.formats?.length){ setStatus(data.error || 'No streams', true); return; }
+      renderYTPlayer(data);
+      setStatus('');
+      ytPlayer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch(e){ setStatus('Error: ' + e.message, true); }
+  }
+
+  function renderYTPlayer(data){
+    ytTitle.textContent  = data.title  || '';
+    ytAuthor.textContent = data.author || '';
+    ytSgrid.innerHTML    = '';
+    ytPlayer.style.display = 'flex';
+
+    const videos = data.formats.filter(f => f.mimeType?.startsWith('video'));
+    const audios = data.formats.filter(f => f.mimeType?.startsWith('audio'));
+    const all    = [...videos, ...audios];
+
+    all.forEach(f => {
+      const btn = document.createElement('button');
+      btn.className   = 'sBtn';
+      btn.textContent = (f.mimeType?.startsWith('audio') ? '\uD83C\uDFB5 ' : '') +
+                        (f.quality||'?') + ' (' + shortMime(f.mimeType) + ')';
+      btn.title = f.mimeType || '';
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.sBtn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        const playing = !ytVideo.paused;
+        ytVideo.src = f.proxyUrl;
+        ytVideo.load();
+        if(playing) ytVideo.play().catch(()=>{});
+      });
+      ytSgrid.appendChild(btn);
+    });
+
+    // auto-select best combined mp4
+    const best = videos.find(f => f.mimeType?.includes('mp4') && !f.mimeType?.includes('av01'))
+              ?? videos[0] ?? audios[0];
+    if(best){
+      const idx  = all.indexOf(best);
+      const btns = ytSgrid.querySelectorAll('.sBtn');
+      if(btns[idx]) btns[idx].click();
+      else if(btns[0]) btns[0].click();
+    }
+  }
+
+  // ── TikTok search / grid ─────────────────────────────────
+  async function loadMoreTT(){
+    setStatus('Searching TikTok…');
+    try {
+      const url  = '/tt/search?q=' + encodeURIComponent(ttQuery) + '&cursor=' + ttCursor;
+      const res  = await fetch(url);
+      const data = await res.json();
+
+      if(data.error && !data.results?.length){
+        setStatus('TikTok: ' + data.error, true);
+        if(!ttItems.length) ttGrid.innerHTML = '<div class="empty">' + esc(data.error) + '</div>';
+        ttMore.style.display = 'none';
+        return;
+      }
+
+      ttItems = ttItems.concat(data.results ?? []);
+      ttCursor  = data.nextCursor ?? '0';
+      ttHasMore = !!data.hasMore;
+      renderTTGrid(data.results ?? []);
+      ttMore.style.display = ttHasMore ? 'block' : 'none';
+      setStatus('');
+    } catch(e){ setStatus('Error: ' + e.message, true); }
+  }
+
+  ttMore.addEventListener('click', loadMoreTT);
+
+  function renderTTGrid(items){
+    if(!items.length && !ttItems.length){
+      ttGrid.innerHTML = '<div class="empty">No TikTok results found.</div>';
+      return;
+    }
+    items.forEach((v, localIdx) => {
+      const globalIdx = ttItems.length - items.length + localIdx;
+      const card = document.createElement('div');
+      card.className = 'tt-thumb-card';
+      card.dataset.title = (v.title||'').toLowerCase();
+      card.dataset.idx   = globalIdx;
+      if(v.cover){
+        const img = document.createElement('img');
+        img.src     = v.cover;
+        img.alt     = '';
+        img.loading = 'lazy';
+        card.appendChild(img);
+      } else {
+        const ph = document.createElement('div');
+        ph.style.cssText = 'width:100%;aspect-ratio:9/16;background:#1a1a1a;display:flex;align-items:center;justify-content:center;color:#555;font-size:.7rem';
+        ph.textContent = 'No preview';
+        card.appendChild(ph);
+      }
+      const titleEl = document.createElement('div');
+      titleEl.className   = 'tt-card-title';
+      titleEl.textContent = v.title || '';
+      card.appendChild(titleEl);
+
+      const authEl = document.createElement('div');
+      authEl.className   = 'tt-card-author';
+      authEl.textContent = v.author ? '@' + v.author : '';
+      card.appendChild(authEl);
+
+      card.addEventListener('click', () => openTTFeed(globalIdx));
+      ttGrid.appendChild(card);
+    });
+  }
+
+  // ── TikTok vertical snap feed ────────────────────────────
+  function openTTFeed(startIdx){
+    ttFeedItems = ttItems;
+    ttFeed.innerHTML     = '';
+    ttFeed.style.display = 'flex';
+    ttGrid.style.display = 'none';
+    ttMore.style.display = 'none';
+
+    ttFeedItems.forEach((v, i) => {
+      const slide = document.createElement('div');
+      slide.className = 'tt-slide';
+
+      const video = document.createElement('video');
+      video.controls    = true;
+      video.loop        = true;
+      video.playsInline = true;
+      video.preload     = 'none';
+      video.src         = v.proxyUrl;
+      slide.appendChild(video);
+
+      const info = document.createElement('div');
+      info.className = 'tt-slide-info';
+      info.innerHTML =
+        '<div class="tt-slide-title">' + esc(v.title||'') + '</div>' +
+        '<div class="tt-slide-author">' + esc(v.author ? '@'+v.author : '') + '</div>';
+      slide.appendChild(info);
+
+      // back-to-grid button on first slide
+      if(i === 0){
+        const back = document.createElement('button');
+        back.textContent = '\u2190 Back';
+        back.style.cssText =
+          'position:absolute;top:10px;left:10px;z-index:5;' +
+          'padding:.3rem .7rem;border-radius:20px;border:none;' +
+          'background:rgba(0,0,0,.6);color:#fff;font-size:.78rem;cursor:pointer';
+        back.addEventListener('click', () => {
+          ttFeed.style.display = 'none';
+          ttGrid.style.display = '';
+          ttMore.style.display = ttHasMore ? 'block' : 'none';
+          // pause any playing video
+          ttFeed.querySelectorAll('video').forEach(v => v.pause());
+        });
+        slide.appendChild(back);
+      }
+
+      ttFeed.appendChild(slide);
+    });
+
+    // scroll to startIdx immediately
+    const targetSlide = ttFeed.children[startIdx];
+    if(targetSlide) targetSlide.scrollIntoView({ behavior: 'instant' });
+
+    // IntersectionObserver — auto-play visible slide, pause others
+    const io = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        const vid = entry.target.querySelector('video');
+        if(!vid) return;
+        if(entry.isIntersecting){
+          vid.play().catch(()=>{});
+        } else {
+          vid.pause();
+        }
+      });
+    }, { root: ttFeed, threshold: 0.6 });
+
+    Array.from(ttFeed.children).forEach(slide => io.observe(slide));
+  }
+
+  // ── Live title filter ────────────────────────────────────
+  filterInp.addEventListener('input', () => applyFilter(filterInp.value));
+
+  function applyFilter(raw){
+    const q = raw.trim().toLowerCase();
+    if(activePlatform === 'yt'){
+      document.querySelectorAll('.yt-card').forEach(el => {
+        el.classList.toggle('hidden', q.length > 0 && !el.dataset.title.includes(q));
+      });
+    } else {
+      document.querySelectorAll('.tt-thumb-card').forEach(el => {
+        el.classList.toggle('hidden', q.length > 0 && !el.dataset.title.includes(q));
+      });
+    }
+  }
+
+  // ── Utilities ────────────────────────────────────────────
+  function setStatus(msg, err){
+    statusEl.textContent = msg;
+    statusEl.className   = err ? 'err' : '';
+  }
+  function clearStatus(){ setStatus(''); }
+
+  function shortMime(mime){
+    if(!mime) return '?';
+    return mime.split(';')[0].split('/')[1] ?? '?';
+  }
+
+  function esc(s){
+    return String(s||'')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+})();
+</script>
+</body>
+</html>`;
